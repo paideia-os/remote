@@ -1,0 +1,428 @@
+// src/kem.pdx -- remote M1-002 (remote#2): ML-KEM-768 key exchange over TCP.
+//
+// Module Kem: the client side of an ML-KEM-768 (FIPS 203) ephemeral
+// handshake carried directly over a connected TCP socket fd (no TLS
+// record layer -- the wire IS the two fixed-size messages below).
+//
+// Wire shape (client-initiated, matches the M1-002 issue text exactly)
+// ---------------------------------------------------------------------
+//   1. Client generates an ephemeral ML-KEM-768 keypair (ek, dk) from
+//      two 32-byte seeds.
+//   2. Client sends the 1184-byte encapsulation key `ek` to the server.
+//   3. Server (out of scope for this client-only wave -- a future
+//      `remoted` daemon) encapsulates against `ek` and returns a
+//      1088-byte ciphertext.
+//   4. Client receives the ciphertext and decapsulates with `dk` to
+//      recover the 32-byte shared secret, which `Channel::ch_init`
+//      (src/channel.pdx) keys the AEAD transport with.
+//
+// Intrinsic linkage
+// ------------------
+// The elaborator's `stdlib_lowering::cryptoops::ml_kem_768` recipe
+// dispatches on the literal (trait_name, method_name) pair at each
+// call site, not on a cross-crate import -- see
+// crates/paideia-as-stdlib/pdx/crypto/ml_kem_768.pdx (paideia-as repo)
+// and tools/user/libpdx-volume/src/pdxb_crypto.pdx (paideia-os repo)
+// for the established precedent this file follows verbatim: redeclare
+// the trait module-locally with the SAME method names the real
+// kernel-linked intrinsic exposes (`keygen`, `encaps`, `decaps`), then
+// call through it. This is the REAL linked intrinsic path, not a WEAK
+// stub -- ml_kem_768.pdx ships in the paideia-as stdlib today.
+//
+// The M1-002 issue text names the intrinsics `mlkem768_keypair` /
+// `_encaps` / `_decaps`; those are this repo's design-vocabulary names
+// for exactly the `MlKem768::keygen` / `::encaps` / `::decaps` calls
+// below (`_encaps` is unused here -- see the client-only note).
+//
+// Client-only scope: `encaps` is the SERVER's step, not the client's,
+// so this file declares the trait method for completeness/documentation
+// but only wires `keygen` + `decaps` into callable wrappers. A future
+// `remoted` daemon module would add its own `kem_encaps_raw` wrapper.
+//
+// SECURITY CAVEAT -- seed entropy (tracked as a known gap; see README.md)
+// -------------------------------------------------------------------
+// No CSPRNG intrinsic (`SecureRandom::fill`) is linked in the current
+// paideia-as stdlib (crypto/ only ships argon2id, chacha20_poly1305,
+// ml_kem_768 -- no rng.pdx), and the paideia-as encoder does not expose
+// an `rdrand`/`rdseed` mnemonic. `kem_fill_seed_bytes` below derives
+// seed material from `rdtsc` ticks mixed with a per-process counter
+// (a splitmix64-shaped avalanche), matching the ONLY entropy-adjacent
+// pattern already established in this codebase (paideia-os
+// src/kernel/core/fs/pdxfs_lite/uuid.pdx's rdtsc-based id generation).
+// This is NOT a cryptographically strong entropy source -- an attacker
+// who can influence or observe TSC-correlated timing could narrow the
+// keypair's randomness. This MUST be replaced with a real linked
+// CSPRNG before this handshake is trusted for anything beyond
+// bootstrap-wave development traffic. Flagged again in README.md.
+//
+// paideia-as compliance (v0.36+)
+// -------------------------------
+//   - Module Kem (PascalCase basename matches src/kem.pdx).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm <= 0x7FFFFFFF.
+//   - r11 is scratch for every lea against a .bss buffer.
+//   - Byte stores via mov_b (#1248 discipline: xor rax,rax; mov_b
+//     rax,[ptr] to load; mov_b [ptr],reg to store the low 8 bits).
+//   - No unsafe-block function here takes more than 4 curried params.
+//   - Reserved-label discipline: every branch label prefixed `kem_`.
+//   - net_send_all / net_recv_all are defined ONCE here (not
+//     duplicated into channel.pdx) because both object files link
+//     into the SAME final binary (remote and rcopy each pull
+//     kem.o + channel.o) -- a duplicate global symbol would be a
+//     link-time multiple-definition error. channel.pdx cross-module
+//     `call`s these two functions by their bare name, matching the
+//     cp precedent (main.pdx calling dispatch.pdx's dispatch_copy by
+//     bare name, no module-qualification at the call site).
+
+module Kem = structure {
+
+  // -- Wire-shape constants (FIPS 203 ML-KEM-768 parameter set) --------
+  pub let KEM_PK_LEN   : u64 = 1184   // encapsulation key (ek)
+  pub let KEM_SK_LEN   : u64 = 2400   // decapsulation key (dk)
+  pub let KEM_CT_LEN   : u64 = 1088   // ciphertext
+  pub let KEM_SS_LEN   : u64 = 32     // shared secret
+  pub let KEM_SEED_LEN : u64 = 32     // each of seed_d / seed_z
+
+  // -- Status codes ------------------------------------------------------
+  pub let KEM_OK             : u64 = 0
+  pub let KEM_ERR_KEYGEN     : u64 = 1
+  pub let KEM_ERR_SEND       : u64 = 2
+  pub let KEM_ERR_RECV       : u64 = 3
+  pub let KEM_ERR_DECAPS     : u64 = 4
+
+  // -- Syscall numbers (design/user/syscall-table.md + tools/user/
+  //    pdxsock/src/main.pdx precedent) ----------------------------------
+  pub let SYS_SEND : u64 = 92
+  pub let SYS_RECV : u64 = 93
+
+  // -- .bss scratch (single global, non-reentrant -- matches every
+  //    other crypto-scratch precedent in this codebase, e.g.
+  //    libpdx-volume's lpv_aead_scratch). -------------------------------
+  pub let mut kem_seed_d : [u8; 32]   = uninit @align(8)
+  pub let mut kem_seed_z : [u8; 32]   = uninit @align(8)
+  pub let mut kem_ek     : [u8; 1184] = uninit @align(8)
+  pub let mut kem_dk     : [u8; 2400] = uninit @align(8)
+  pub let mut kem_ct     : [u8; 1088] = uninit @align(8)
+
+  // Entropy-mixer state. Seeded implicitly by the first rdtsc read
+  // (starts at 0; the first kem_mix_next call folds in a real TSC
+  // sample before anything is ever emitted, so the all-zero initial
+  // state is never itself used as output).
+  pub let mut kem_entropy_state : u64 = 0
+
+  // =========================================================================
+  // kem_mix_next() -> u64
+  //
+  // One splitmix64-shaped avalanche step folding a fresh rdtsc sample
+  // into kem_entropy_state. NOT a CSPRNG -- see module header caveat.
+  // Leaf; no push/pop parity needed (no nested calls).
+  // =========================================================================
+  pub let kem_mix_next : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "remote#2: kem_mix_next. rdtsc -> rax=low32, rdx=high32; shl rdx,32; or rax,rdx reconstructs the full 64-bit tick counter (proven pattern, src/kernel/core/fs/pdxfs_lite/uuid.pdx and tools/user/cp/src/pipe.pdx). Load kem_entropy_state into r10, xor with the fresh tick value, then run one splitmix64 finalizer step (xor-shr-multiply-by-odd-constant via repeated shl/add since paideia-as bans 2-op imul: approximate the multiply with a shift-add ladder against the fixed odd constant 0x9E3779B97F4A7C15 is impractical without imul, so this step instead does two xor-shr rounds -- weaker than true splitmix64 but still better than raw rdtsc alone, and the module header already flags this whole path as non-cryptographic). Store the mixed value back to kem_entropy_state and return it. r11 is the scratch address register for the .bss access.",
+      block: {
+        rdtsc;
+        shl rdx, 32;
+        or  rax, rdx;                    // rax = fresh 64-bit tick sample
+
+        lea r11, [rip + kem_entropy_state];
+        mov r10, [r11];
+        xor r10, rax;                    // fold tick sample into state
+
+        // Two xor-shr avalanche rounds (splitmix64-adjacent; no imul
+        // available under the encoder's mnemonic restrictions).
+        mov rax, r10;
+        shr rax, 33;
+        xor r10, rax;
+        mov rax, r10;
+        shr rax, 29;
+        xor r10, rax;
+
+        mov [r11], r10;                  // persist new state
+        mov rax, r10;                    // return value
+        ret
+      }
+    }
+
+  // =========================================================================
+  // kem_fill_seed_bytes(out_ptr, len) -> ()
+  //
+  // Fills len bytes at out_ptr with kem_mix_next() output, one byte per
+  // call (simplest-correct; len is always 32 at this landing's call
+  // sites so the call-per-byte cost is bounded and not perf-critical).
+  // =========================================================================
+  pub let kem_fill_seed_bytes : (u64, u64) -> () !{mem} @{} =
+    fn (out_ptr: u64) (len: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "remote#2: kem_fill_seed_bytes. 3-push callee-save (rbx=out_ptr, r12=len, r13=loop counter i), NO extra pad needed: entry rsp%16==8 (post-CALL); push rbx -> 0; push r12 -> 8; push r13 -> 0, which already lands rsp%16==0 for the single nested call site (call kem_mix_next) inside the loop -- an odd count of 8-byte pushes from an rsp%16==8 entry always lands on 0, so no `sub rsp,8` pad is needed or present here (unlike the 2-push functions elsewhere in this file, which DO need the pad because 2 is even). Loop counter r13 = 0. Body: call kem_mix_next (no args, callee-save regs rbx/r12/r13 all survive it); lea r10,[rbx + r13] (r10 is caller-save scratch, safe to use without preserving) then mov_b [r10], rax writes the low 8 bits of the mixed value at the current offset. add r13,1; cmp r13, r12; jl loop. Reserved labels prefixed kem_fsb_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                    // out_ptr
+        mov r12, rsi;                    // len
+        xor r13, r13;                    // i = 0
+
+      kem_fsb_loop:
+        cmp r13, r12;
+        jge kem_fsb_done;
+
+        call kem_mix_next;
+
+        lea r10, [rbx + r13];
+        mov_b [r10], rax;
+
+        add r13, 1;
+        jmp kem_fsb_loop;
+
+      kem_fsb_done:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // -------------------------------------------------------------------------
+  // Local trait declaration (module-local dispatch; see module header).
+  // -------------------------------------------------------------------------
+  trait MlKem768 {
+    fn keygen(seed_d_ptr: u64, seed_z_ptr: u64, ek_out_ptr: u64, dk_out_ptr: u64)
+      -> i64 !{crypto, mem} @{paideia.crypto};
+    fn encaps(ek_ptr: u64, seed_m_ptr: u64, ct_out_ptr: u64, ss_out_ptr: u64)
+      -> i64 !{crypto, mem} @{paideia.crypto};
+    fn decaps(dk_ptr: u64, ct_ptr: u64, ss_out_ptr: u64)
+      -> i64 !{crypto, mem} @{paideia.crypto};
+  }
+
+  // Plain lambda-body trait-call wrappers -- the only way to reach the
+  // stdlib_lowering trait-call recipe is a call expression at a
+  // lambda-body / tail-expression position (pdxb_sign.pdx precedent).
+  pub let kem_keygen_raw : (u64, u64, u64, u64) -> i64 !{crypto, mem} @{paideia.crypto} =
+    fn (seed_d_ptr: u64, seed_z_ptr: u64, ek_out_ptr: u64, dk_out_ptr: u64) ->
+      MlKem768::keygen(seed_d_ptr, seed_z_ptr, ek_out_ptr, dk_out_ptr)
+
+  pub let kem_decaps_raw : (u64, u64, u64) -> i64 !{crypto, mem} @{paideia.crypto} =
+    fn (dk_ptr: u64, ct_ptr: u64, ss_out_ptr: u64) ->
+      MlKem768::decaps(dk_ptr, ct_ptr, ss_out_ptr)
+
+  // =========================================================================
+  // net_send_all(fd, ptr, len) -> u64   (0 = OK, 1 = error)
+  //
+  // Loops sys_send until every byte is sent. The kernel caps a single
+  // sys_send at 1024 bytes AND returns the actual bytes sent (not
+  // necessarily what was requested even under the cap) -- design/user/
+  // syscall-table.md + src/kernel/core/syscall/handlers/sys_send.pdx.
+  // This loop advances by the syscall's OWN return value each
+  // iteration rather than assuming full-length delivery.
+  // =========================================================================
+  pub let net_send_all : (u64, u64, u64) -> u64 !{mem, sysreg} @{fs, cap} =
+    fn (fd: u64) (ptr: u64) (len: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs, cap},
+      justification: "remote#2/#3 shared helper: net_send_all. 4-push callee-save (rbx=fd, r12=cur_ptr, r13=remaining, r14=pad-unused-kept-for-symmetry) -- actually 3 pushes suffice (rbx,r12,r13) + sub rsp,8: entry rsp%16==8, 3 pushes (24B) land rsp%16==8, pad -8 -> 0 for the nested SYSCALL site (SYSCALL itself is stack-invariant but the loop body's own bookkeeping keeps the same discipline as every other nested-CALL site in this file for uniformity). Loop: cmp r13,0; jle done (nothing left / already done). mov rdi,rbx (fd); mov rsi,r12 (cur_ptr); mov rdx,r13 (remaining); mov rax,92 (SYS_SEND); syscall. cmp rax,0; jle net_send_all_err (0 or negative-errno both fail -- a 0-byte send on a live socket means the kernel refused to make progress, treated as an error at this framing layer rather than retried forever). add r12,rax (advance cur_ptr by bytes actually sent); sub_via r13: r13 = r13 - rax using mov+sub is fine here since paideia-as's ban is on `sub reg,reg` for TWO register operands aliasing the same identity in an ambiguous zero-vs-subtract sense per file_read.pdx's own note -- r13 and rax are distinct registers so `sub r13, rax` is an ordinary register-register subtract, not the banned form. jmp loop.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // fd
+        mov r12, rsi;                    // cur_ptr
+        mov r13, rdx;                    // remaining
+
+      kem_nsa_loop:
+        cmp r13, 0;
+        jle kem_nsa_ok;
+
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, r13;
+        mov rax, 92;                     // SYS_SEND
+        syscall;
+
+        cmp rax, 0;
+        jle kem_nsa_err;
+
+        add r12, rax;
+        sub r13, rax;
+        jmp kem_nsa_loop;
+
+      kem_nsa_ok:
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        pop rbx;
+        xor rax, rax;                    // 0 = OK
+        ret;
+
+      kem_nsa_err:
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        pop rbx;
+        mov rax, 1;                      // 1 = error
+        ret
+      }
+    }
+
+  // =========================================================================
+  // net_recv_all(fd, ptr, len) -> u64   (0 = OK, 1 = error/EOF)
+  //
+  // Loops sys_recv until exactly len bytes are read. TCP is a byte
+  // stream (src/kernel/core/syscall/handlers/sys_recv.pdx's KIND_TCP_
+  // SOCKET branch) so a single sys_recv may return fewer bytes than
+  // requested; a return of 0 means the peer's rx ring was empty at
+  // this framing layer we treat as a hard failure (no long-poll /
+  // sys_yield retry wired at this landing -- see README known gaps).
+  // =========================================================================
+  pub let net_recv_all : (u64, u64, u64) -> u64 !{mem, sysreg} @{fs, cap} =
+    fn (fd: u64) (ptr: u64) (len: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs, cap},
+      justification: "remote#2/#3 shared helper: net_recv_all. Same register plan and push discipline as net_send_all above, using SYS_RECV=93 in place of SYS_SEND=92. cmp rax,0; jle net_recv_all_err treats both a negative-errno return AND a 0 (empty-ring / peer EOF) as failure at this framing layer -- a real production version would sys_yield-and-retry on 0 the way shell's kind_tty_read_one does for TTY_READ_EMPTY, but that is out of scope for this landing (documented in README.md known gaps as the blocking-alternation-pump limitation).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // fd
+        mov r12, rsi;                    // cur_ptr
+        mov r13, rdx;                    // remaining
+
+      kem_nra_loop:
+        cmp r13, 0;
+        jle kem_nra_ok;
+
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, r13;
+        mov rax, 93;                     // SYS_RECV
+        syscall;
+
+        cmp rax, 0;
+        jle kem_nra_err;
+
+        add r12, rax;
+        sub r13, rax;
+        jmp kem_nra_loop;
+
+      kem_nra_ok:
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        pop rbx;
+        xor rax, rax;
+        ret;
+
+      kem_nra_err:
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        pop rbx;
+        mov rax, 1;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // kem_client_handshake(fd, out_ss_ptr) -> u64
+  //
+  // Full client-side ML-KEM-768 handshake over the already-connected
+  // socket `fd`. Writes the 32-byte shared secret to out_ss_ptr on
+  // success (KEM_OK). On any failure out_ss_ptr is left untouched and
+  // a nonzero KEM_ERR_* is returned.
+  // =========================================================================
+  pub let kem_client_handshake : (u64, u64) -> u64 !{crypto, mem, sysreg} @{paideia.crypto, fs, cap} =
+    fn (fd: u64) (out_ss_ptr: u64) -> unsafe {
+      effects: {crypto, mem, sysreg},
+      capabilities: {paideia.crypto, fs, cap},
+      justification: "remote#2: kem_client_handshake orchestration. 2-push callee-save (rbx=fd, r12=out_ss_ptr) + sub rsp,8 keeps rsp%16==0 at every nested call (kem_fill_seed_bytes x2, kem_keygen_raw, net_send_all, net_recv_all, kem_decaps_raw). Sequence: fill kem_seed_d (32B) + kem_seed_z (32B) via rdtsc-mixer (module caveat: not cryptographically strong); kem_keygen_raw(&seed_d,&seed_z,&kem_ek,&kem_dk) -> cmp rax,0/jne fail(KEM_ERR_KEYGEN); net_send_all(fd,&kem_ek,1184) -> jne fail(KEM_ERR_SEND); net_recv_all(fd,&kem_ct,1088) -> jne fail(KEM_ERR_RECV); kem_decaps_raw(&kem_dk,&kem_ct,out_ss_ptr) -- writes the 32-byte shared secret DIRECTLY into the caller's out_ss_ptr (r12), no extra .bss copy needed -- -> jne fail(KEM_ERR_DECAPS); return KEM_OK (0). Every `lea rX,[rip + kem_*]` uses r11 as the scratch address register per this file's own discipline; the four .bss buffer addresses are re-derived fresh before each call rather than cached across calls that could clobber r11.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // fd
+        mov r12, rsi;                    // out_ss_ptr
+
+        lea r11, [rip + kem_seed_d];
+        mov rdi, r11;
+        mov rsi, 32;
+        call kem_fill_seed_bytes;
+
+        lea r11, [rip + kem_seed_z];
+        mov rdi, r11;
+        mov rsi, 32;
+        call kem_fill_seed_bytes;
+
+        lea rdi, [rip + kem_seed_d];
+        lea rsi, [rip + kem_seed_z];
+        lea rdx, [rip + kem_ek];
+        lea rcx, [rip + kem_dk];
+        call kem_keygen_raw;
+        cmp rax, 0;
+        jne kem_kh_fail_keygen;
+
+        mov rdi, rbx;
+        lea rsi, [rip + kem_ek];
+        mov rdx, 1184;
+        call net_send_all;
+        cmp rax, 0;
+        jne kem_kh_fail_send;
+
+        mov rdi, rbx;
+        lea rsi, [rip + kem_ct];
+        mov rdx, 1088;
+        call net_recv_all;
+        cmp rax, 0;
+        jne kem_kh_fail_recv;
+
+        lea rdi, [rip + kem_dk];
+        lea rsi, [rip + kem_ct];
+        mov rdx, r12;
+        call kem_decaps_raw;
+        cmp rax, 0;
+        jne kem_kh_fail_decaps;
+
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        xor rax, rax;                    // KEM_OK
+        ret;
+
+      kem_kh_fail_keygen:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        mov rax, 1;                      // KEM_ERR_KEYGEN
+        ret;
+
+      kem_kh_fail_send:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        mov rax, 2;                      // KEM_ERR_SEND
+        ret;
+
+      kem_kh_fail_recv:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        mov rax, 3;                      // KEM_ERR_RECV
+        ret;
+
+      kem_kh_fail_decaps:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        mov rax, 4;                      // KEM_ERR_DECAPS
+        ret
+      }
+    }
+}

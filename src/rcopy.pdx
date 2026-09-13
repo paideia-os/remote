@@ -1,0 +1,533 @@
+// src/rcopy.pdx -- remote M1-005 (remote#5): `rcopy <local> <host>:<remote>`.
+//
+// Module Rcopy: entry point (`_start`) for the `rcopy` binary. Same
+// KEM+channel handshake as `remote` (src/kem.pdx, src/channel.pdx),
+// then a single-daemon-port file-copy protocol: send a COPY request
+// record, stream the source file in 4096-byte chunks, waiting for a
+// per-chunk ACK frame from the server before sending the next chunk.
+//
+// Usage: `rcopy <local> <host>:<remote>` -- <host> is a dotted-quad
+// IPv4 literal (no resolver syscall exists yet); <remote> is the
+// destination path on the remote host, opaque to this client (the
+// out-of-scope future `remoted` daemon interprets it).
+//
+// Wire protocol (application layer, carried inside Channel frames)
+// -------------------------------------------------------------------
+//   Client -> server, ONE frame: COPY request record --
+//     [0]      op = RC_OP_COPY (3)                       (1 byte)
+//     [1..5)   name_len                                   (u32 LE)
+//     [5..5+N) name_bytes (the <remote> path, N = name_len bytes)
+//     [+0..8)  size (local file size in bytes)             (u64)
+//     [+8..40) sha256 (SEE STUB CAVEAT BELOW)               (32 bytes)
+//   Server -> client: 1-byte status frame (RC_STATUS_OK=0 / other=fail).
+//   Then, repeated per 4096-byte (or shorter final) chunk:
+//     Client -> server: chunk bytes as ONE Channel frame.
+//     Server -> client: 1-byte status frame (ack).
+//   EOF on the local file ends the loop; no explicit "done" opcode is
+//   sent -- the server infers completion once it has received `size`
+//   bytes total (out of scope for this client-only wave to verify).
+//
+// SHA-256 STUB CAVEAT (tracked as a known gap; see README.md)
+// -------------------------------------------------------------------
+// No `Sha256` stdlib trait is linked in the current paideia-as
+// toolchain (crypto/ ships argon2id, chacha20_poly1305, ml_kem_768
+// only -- no sha256.pdx). `rc_sha256_stub` below fills the 32-byte
+// digest field with ZERO BYTES rather than fabricating a fake hash
+// value that could be mistaken for a real integrity check. A future
+// landing (once a real digest primitive is linked, or a from-scratch
+// SHA-256 implementation is scoped as its own issue) replaces this
+// stub; every other part of the wire shape (offsets, field widths) is
+// final today so that swap is a body-only change.
+//
+// paideia-as compliance (v0.36+)
+// -------------------------------
+//   - Module Rcopy (PascalCase basename matches src/rcopy.pdx).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm <= 0x7FFFFFFF.
+//   - r11 is scratch for every lea against a .bss buffer; r10 is
+//     additional caller-save scratch where a second address is live.
+//   - No unsafe-block function here takes more than 4 curried params.
+//   - Reserved-label discipline: every branch label prefixed `rcp_`.
+//   - _start enters with rsp%16==0 (execve ABI, NOT the rsp%16==8
+//     every CALL-invoked function in this file assumes) and ends every
+//     terminal path in `hlt` (never `ret`) under `@no_frame`, matching
+//     tools/user/cat/src/entry.pdx and tools/user/pdxsock/src/main.pdx.
+
+module Rcopy = structure {
+
+  pub let RCP_PORT : u64 = 22
+
+  pub let RC_OP_COPY   : u64 = 3
+  pub let RC_STATUS_OK : u64 = 0
+
+  pub let RCP_MAX_NAME  : u64 = 255
+  pub let RCP_CHUNK_LEN : u64 = 4096
+
+  pub let SYS_SOCKET : u64 = 87
+  pub let SYS_CONNECT: u64 = 91
+  pub let SYS_OPEN   : u64 = 2
+  pub let SYS_READ   : u64 = 0
+  pub let SYS_CLOSE  : u64 = 3
+  pub let SYS_STAT   : u64 = 77
+  pub let SYS_EXIT   : u64 = 60
+
+  pub let RCP_IP_PARSE_FAIL : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // -- .bss scratch --------------------------------------------------------
+  pub let mut rcp_shared_secret : [u8; 32]   = uninit @align(8)
+  pub let mut rcp_req_buf       : [u8; 4096] = uninit @align(8)
+  pub let mut rcp_chunk_buf     : [u8; 4096] = uninit @align(8)
+  pub let mut rcp_ack_len       : u64        = 0
+  pub let mut rcp_statbuf       : [u8; 64]   = uninit @align(8)
+
+  pub let rcp_usage_msg        : [u8; 37] = "usage: rcopy <local> <host>:<remote>\n"
+  pub let rcp_err_open_msg     : [u8; 19] = "rcopy: open failed\n"
+  pub let rcp_err_connect_msg  : [u8; 22] = "rcopy: connect failed\n"
+  pub let rcp_err_kem_msg      : [u8; 28] = "rcopy: kem handshake failed\n"
+  pub let rcp_err_ack_msg      : [u8; 22] = "rcopy: server refused\n"
+
+  // =========================================================================
+  // rcp_parse_ipv4(str_ptr) -> u64
+  //
+  // Identical shape to RemoteClient::rc_parse_ipv4 (src/remote_client.pdx)
+  // -- duplicated here rather than shared because `remote` and `rcopy`
+  // are two independent `ld` link steps (see src/kem.pdx module header
+  // for why net_send_all/net_recv_all are NOT duplicated: those two
+  // link into the SAME binary via kem.o, but rc_parse_ipv4 never does).
+  // =========================================================================
+  pub let rcp_parse_ipv4 : (u64) -> u64 !{mem} @{} =
+    fn (str_ptr: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "remote#5: rcp_parse_ipv4, byte-identical logic to RemoteClient::rc_parse_ipv4 (see that function's justification for the full digit-loop rationale). 5-push callee-save (rbx=cursor, r12=octet index, r13=result, r14=octet value, r15=digit count); odd push count from rsp%16==8 entry lands on 0 -- no CALLs in this leaf-loop function anyway. Reserved labels prefixed rcp_ip_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;
+        xor r12, r12;
+        xor r13, r13;
+
+      rcp_ip_octet_loop:
+        cmp r12, 4;
+        jge rcp_ip_done;
+
+        xor r14, r14;
+        xor r15, r15;
+
+      rcp_ip_digit_loop:
+        xor rax, rax;
+        mov_b rax, [rbx];
+
+        cmp rax, 0x30;
+        jl rcp_ip_digits_end;
+        cmp rax, 0x39;
+        jg rcp_ip_digits_end;
+
+        sub rax, 0x30;
+        mov r10, r14;
+        shl r14, 3;
+        add r14, r10;
+        add r14, r10;
+        add r14, rax;
+
+        add r15, 1;
+        add rbx, 1;
+        jmp rcp_ip_digit_loop;
+
+      rcp_ip_digits_end:
+        cmp r15, 0;
+        je rcp_ip_fail;
+
+        cmp r14, 255;
+        jg rcp_ip_fail;
+
+        shl r13, 8;
+        or  r13, r14;
+
+        cmp r12, 3;
+        je rcp_ip_expect_nul;
+
+        cmp rax, 0x2E;
+        jne rcp_ip_fail;
+        add rbx, 1;
+        jmp rcp_ip_next_octet;
+
+      rcp_ip_expect_nul:
+        cmp rax, 0;
+        jne rcp_ip_fail;
+
+      rcp_ip_next_octet:
+        add r12, 1;
+        jmp rcp_ip_octet_loop;
+
+      rcp_ip_done:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        mov rax, r13;
+        ret;
+
+      rcp_ip_fail:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // rcp_split_host_remote(arg_ptr) -> u64
+  //
+  // In-place splits "<host>:<remote>" at the first ':' by overwriting
+  // it with a NUL byte, so arg_ptr becomes the NUL-terminated host
+  // string and the return value is the address of the remote-path
+  // substring (arg_ptr + colon_index + 1). Returns 0 if no ':' is
+  // found (malformed argument -- 0 is never a valid remote-path
+  // address since the loader never maps VA 0).
+  // =========================================================================
+  pub let rcp_split_host_remote : (u64) -> u64 !{mem} @{} =
+    fn (arg_ptr: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "remote#5: rcp_split_host_remote. Leaf, no nested calls, no push/pop parity needed beyond the one callee-save this function actually needs (rbx=arg_ptr, preserved across the scan). Scans byte-by-byte via xor rax,rax; mov_b rax,[rbx+r10] (r10=cursor, caller-save) until ':' (0x3A) or NUL (0x00, meaning no colon -- malformed). On ':' hit: mov_b [rbx+r10],0 overwrites it with NUL, terminating the host string in place; lea rax,[rbx+r10+1] computes the remote-path start address (colon index + 1) and returns it. On NUL-before-colon, return 0 (RCP_SPLIT_FAIL sentinel, distinguishable from any real heap/stack address the loader would ever hand out).",
+      block: {
+        push rbx;
+        mov rbx, rdi;
+        xor r10, r10;
+
+      rcp_split_loop:
+        xor rax, rax;
+        mov_b rax, [rbx + r10];
+
+        cmp rax, 0x3A;                   // ':'
+        je rcp_split_hit;
+
+        cmp rax, 0;
+        je rcp_split_fail;
+
+        add r10, 1;
+        jmp rcp_split_loop;
+
+      rcp_split_hit:
+        lea r11, [rbx + r10];
+        mov rax, 0;
+        mov_b [r11], rax;
+
+        lea rax, [r11 + 1];
+        pop rbx;
+        ret;
+
+      rcp_split_fail:
+        xor rax, rax;
+        pop rbx;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // rc_sha256_stub(data_ptr, len, out32_ptr) -> ()
+  //
+  // STUB (see module header caveat): writes 32 zero bytes to
+  // out32_ptr. data_ptr / len are accepted (and named to match the
+  // eventual real signature) but not read.
+  // =========================================================================
+  pub let rc_sha256_stub : (u64, u64, u64) -> () !{mem} @{} =
+    fn (data_ptr: u64) (len: u64) (out32_ptr: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "remote#5: rc_sha256_stub. Leaf; zero-fills 32 bytes at out32_ptr (rdx) via two 16-byte qword-pair stores (four `mov [out32_ptr+N],rax` with rax pre-zeroed) rather than a byte loop -- no loop needed since the fill value is constant. data_ptr/len (rdi/rsi) are accepted but unused, matching the eventual real Sha256::digest(data_ptr,len,out_ptr) call shape this stub stands in for.",
+      block: {
+        xor rax, rax;
+        mov [rdx + 0], rax;
+        mov [rdx + 8], rax;
+        mov [rdx + 16], rax;
+        mov [rdx + 24], rax;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // rcp_fail(msg_ptr, msg_len) -> ()   [never returns; sys_exit(1)]
+  // =========================================================================
+  pub let rcp_fail : (u64, u64) -> () !{mem, sysreg} @{fs} =
+    fn (msg_ptr: u64) (msg_len: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs},
+      justification: "remote#5: rcp_fail, identical shape to RemoteClient::rc_fail (see that function's justification for why an ordinary called function that internally sys_exits still ends in `ret` with no @no_frame -- the shell/src/builtins.pdx bi_exit precedent). sys_write(2,msg_ptr,msg_len) then sys_exit(1); the trailing `ret` is unreachable dead code required only to satisfy paideia-as's function-shape terminator check.",
+      block: {
+        mov r10, rdi;
+        mov rdx, rsi;
+        mov rdi, 2;
+        mov rsi, r10;
+        mov rax, 1;
+        syscall;
+
+        mov rdi, 1;
+        mov rax, 60;
+        syscall;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // _start -- rcopy entry point. execve ABI: rdi=argc, rsi=argv,
+  // rdx=envp, rsp%16==0 at entry.
+  // =========================================================================
+  pub let _start : () -> () !{crypto, mem, sysreg} @{paideia.crypto, fs, cap} =
+    fn () -> unsafe {
+      effects: {crypto, mem, sysreg},
+      capabilities: {paideia.crypto, fs, cap},
+      justification: "remote#5: _start real body. execve ABI entry has rsp%16==0. 5-push callee-save (rbx=argc/local_fd, r12=argv, r13=sock_fd, r14=remote_path_ptr, r15=local_size) -- an ODD count of pushes from a 0-aligned entry lands on 8, which is WRONG for a nested call, so an additional `sub rsp, 8` brings it back to 0 (5 pushes + 1 pad = 6 total 8-byte adjustments, even, from entry 0 -> 0). Flow: (1) cmp rdi,3; jne usage-fail (argv[0]=prog, argv[1]=local, argv[2]='host:remote'). (2) mov r10,[r12+16] (argv[2]); call rcp_split_host_remote; cmp rax,0; je usage-fail; mov r14,rax (remote_path_ptr); argv[2] itself (now NUL-terminated at the colon) is the host string. (3) call rcp_parse_ipv4(argv[2]) -> cmp against 0xFFFFFFFFFFFFFFFF sentinel -> usage-fail. (4) sys_open([r12+8] i.e. argv[1], O_RDONLY=0, 0) SC+2 -> cmp rax,0; jl open-fail; mov rbx,rax (local fd). (5) sys_stat(argv[1], &rcp_statbuf) SC+77 (rdi=path,rsi=255 path-len-cap,rdx=&statbuf) -> mov r15,[rcp_statbuf+8] (size field, per the frozen 64-byte stat layout: ino@+0, size@+8 -- tools/user/cp/src/pdxfs.pdx precedent). (6) sys_socket + sys_connect(parsed_ip, 22) same shape as RemoteClient::_start -> mov r13,fd. (7) kem_client_handshake(r13,&rcp_shared_secret) -> kem-fail. (8) ch_init(&rcp_shared_secret). (9) Build COPY request into rcp_req_buf: [0]=RC_OP_COPY(3); [1..5)=name_len (strlen of remote_path via a small inline scan, mov_d store); [5..5+name_len)=name bytes (byte-copy loop); then size (u64, r15) and 32 zero-filled sha256 bytes (rc_sha256_stub(0,0,&digest-position) -- data_ptr/len unused by the stub) written immediately after. total_len computed as 5+name_len+8+32. ch_send_frame(r13,&rcp_req_buf,total_len) -> send-fail. ch_recv_frame(r13,&rcp_req_buf,4096,&rcp_ack_len) -> recv-fail; check rcp_req_buf[0]==RC_STATUS_OK -> ack-fail. (10) chunk loop: sys_read(rbx,&rcp_chunk_buf,4096) SC+0 -> cmp rax,0; jle done (EOF or error); mov rdx,rax; ch_send_frame(r13,&rcp_chunk_buf,rdx) -> send-fail; ch_recv_frame(r13,&rcp_req_buf,4096,&rcp_ack_len) -> recv-fail; check status OK -> ack-fail; loop. (11) done: sys_close(rbx) SC+3; sys_exit(0). Every terminal path funnels to a `hlt` under @no_frame; every fail path calls rcp_fail (itself never-returning) then hlt defensively. Reserved labels prefixed rcp_start_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // argc (repurposed to local fd later)
+        mov r12, rsi;                    // argv
+
+        cmp rbx, 3;
+        jne rcp_start_usage_fail;
+
+        mov rdi, [r12 + 16];             // argv[2] = "host:remote"
+        call rcp_split_host_remote;
+        cmp rax, 0;
+        je rcp_start_usage_fail;
+        mov r14, rax;                    // remote_path_ptr
+
+        mov rdi, [r12 + 16];             // argv[2], now NUL-terminated host
+        call rcp_parse_ipv4;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je rcp_start_usage_fail;
+        mov r9, rax;                     // parsed ip, staged in r9 (caller-save,
+                                          // re-read below before it could be
+                                          // clobbered by the sys_open/stat calls)
+
+        mov rdi, [r12 + 8];              // argv[1] = local path
+        mov rsi, 0;                      // O_RDONLY
+        mov rdx, 0;
+        mov rax, 2;                      // SYS_OPEN
+        syscall;
+        cmp rax, 0;
+        jl rcp_start_open_fail;
+        mov rbx, rax;                    // local fd
+
+        mov rdi, [r12 + 8];              // argv[1]
+        mov rsi, 255;                    // path-len walker cap
+        lea rdx, [rip + rcp_statbuf];
+        mov rax, 77;                     // SYS_STAT
+        syscall;
+
+        lea r11, [rip + rcp_statbuf];
+        mov r15, [r11 + 8];              // local file size
+
+        mov rdi, 2;                      // AF_INET
+        mov rsi, 1;                      // SOCK_STREAM
+        mov rdx, 0;
+        mov rax, 87;                     // SYS_SOCKET
+        syscall;
+        cmp rax, 0;
+        jl rcp_start_connect_fail;
+        mov r13, rax;                    // sock fd
+
+        mov rdi, r13;
+        mov rsi, r9;                     // parsed remote_ip
+        mov rdx, 22;                     // RCP_PORT
+        mov rax, 91;                     // SYS_CONNECT
+        syscall;
+        cmp rax, 0;
+        jl rcp_start_connect_fail;
+
+        mov rdi, r13;
+        lea rsi, [rip + rcp_shared_secret];
+        call kem_client_handshake;
+        cmp rax, 0;
+        jne rcp_start_kem_fail;
+
+        lea rdi, [rip + rcp_shared_secret];
+        call ch_init;
+
+        // -- build COPY request -------------------------------------------
+        lea r11, [rip + rcp_req_buf];
+        mov rax, 3;                      // RC_OP_COPY
+        mov_b [r11], rax;
+
+        // name_len = strlen(remote_path), capped defensively at
+        // RCP_MAX_NAME via the loop guard below.
+        mov r8, r14;                     // scan cursor
+        xor r10, r10;                    // name_len accumulator
+
+      rcp_start_namelen_loop:
+        cmp r10, 255;
+        jge rcp_start_namelen_done;
+
+        xor rax, rax;
+        mov_b rax, [r8 + r10];
+        cmp rax, 0;
+        je rcp_start_namelen_done;
+
+        add r10, 1;
+        jmp rcp_start_namelen_loop;
+
+      rcp_start_namelen_done:
+        lea r11, [rip + rcp_req_buf];
+        mov_d [r11 + 1], r10;            // name_len (u32)
+
+        // Byte-copy the name into rcp_req_buf[5 .. 5+name_len).
+        xor r9, r9;                      // copy index
+
+      rcp_start_namecopy_loop:
+        cmp r9, r10;
+        jge rcp_start_namecopy_done;
+
+        xor rax, rax;
+        mov_b rax, [r14 + r9];
+        lea r11, [rip + rcp_req_buf];
+        lea r11, [r11 + 5];
+        lea r11, [r11 + r9];
+        mov_b [r11], rax;
+
+        add r9, 1;
+        jmp rcp_start_namecopy_loop;
+
+      rcp_start_namecopy_done:
+        // size (u64) immediately after the name.
+        lea r11, [rip + rcp_req_buf];
+        lea r11, [r11 + 5];
+        lea r11, [r11 + r10];
+        mov [r11], r15;
+
+        // 32 zero-filled sha256 bytes immediately after size.
+        lea r11, [rip + rcp_req_buf];
+        lea r11, [r11 + 5];
+        lea r11, [r11 + r10];
+        add r11, 8;
+        mov rdi, 0;
+        mov rsi, 0;
+        mov rdx, r11;
+        call rc_sha256_stub;
+
+        // total_len = 5 + name_len + 8 + 32
+        mov rax, r10;
+        add rax, 45;                     // 5 + 8 + 32
+
+        mov rdi, r13;
+        lea rsi, [rip + rcp_req_buf];
+        mov rdx, rax;
+        call ch_send_frame;
+        cmp rax, 0;
+        jne rcp_start_send_fail;
+
+        mov rdi, r13;
+        lea rsi, [rip + rcp_req_buf];
+        mov rdx, 4096;
+        lea rcx, [rip + rcp_ack_len];
+        call ch_recv_frame;
+        cmp rax, 0;
+        jne rcp_start_recv_fail;
+
+        lea r11, [rip + rcp_req_buf];
+        xor rax, rax;
+        mov_b rax, [r11];
+        cmp rax, 0;                      // RC_STATUS_OK
+        jne rcp_start_ack_fail;
+
+      rcp_start_chunk_loop:
+        mov rdi, rbx;                    // local fd
+        lea rsi, [rip + rcp_chunk_buf];
+        mov rdx, 4096;
+        mov rax, 0;                      // SYS_READ
+        syscall;
+        cmp rax, 0;
+        jle rcp_start_done;
+
+        mov rdi, r13;
+        lea rsi, [rip + rcp_chunk_buf];
+        mov rdx, rax;
+        call ch_send_frame;
+        cmp rax, 0;
+        jne rcp_start_send_fail;
+
+        mov rdi, r13;
+        lea rsi, [rip + rcp_req_buf];
+        mov rdx, 4096;
+        lea rcx, [rip + rcp_ack_len];
+        call ch_recv_frame;
+        cmp rax, 0;
+        jne rcp_start_recv_fail;
+
+        lea r11, [rip + rcp_req_buf];
+        xor rax, rax;
+        mov_b rax, [r11];
+        cmp rax, 0;
+        jne rcp_start_ack_fail;
+
+        jmp rcp_start_chunk_loop;
+
+      rcp_start_done:
+        mov rdi, rbx;
+        mov rax, 3;                      // SYS_CLOSE
+        syscall;
+
+        mov rdi, 0;
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      rcp_start_usage_fail:
+        lea rdi, [rip + rcp_usage_msg];
+        mov rsi, 37;
+        call rcp_fail;
+        hlt;
+
+      rcp_start_open_fail:
+        lea rdi, [rip + rcp_err_open_msg];
+        mov rsi, 19;
+        call rcp_fail;
+        hlt;
+
+      rcp_start_connect_fail:
+        lea rdi, [rip + rcp_err_connect_msg];
+        mov rsi, 22;
+        call rcp_fail;
+        hlt;
+
+      rcp_start_kem_fail:
+        lea rdi, [rip + rcp_err_kem_msg];
+        mov rsi, 28;
+        call rcp_fail;
+        hlt;
+
+      rcp_start_send_fail:
+        lea rdi, [rip + rcp_err_ack_msg];
+        mov rsi, 22;
+        call rcp_fail;
+        hlt;
+
+      rcp_start_recv_fail:
+        lea rdi, [rip + rcp_err_ack_msg];
+        mov rsi, 22;
+        call rcp_fail;
+        hlt;
+
+      rcp_start_ack_fail:
+        lea rdi, [rip + rcp_err_ack_msg];
+        mov rsi, 22;
+        call rcp_fail;
+        hlt
+      }
+    } @no_frame
+}

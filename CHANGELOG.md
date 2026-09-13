@@ -1,0 +1,40 @@
+# Changelog
+
+All notable changes to `remote` are documented in this file.
+
+## [0.5.0] - 2026-09-13
+
+Wave SS 5-issue cohort -- initial landing of the whole M1 milestone in
+one tagged commit.
+
+- **remote#1** (M1-001): repo bootstrap -- README.md, LICENSE (MIT),
+  CHANGELOG.md, caps.decl (`KIND_USER` + `KIND_TCP_SOCKET` narrowed to
+  `connect` + `KIND_TTY` + `KIND_PDXFS_FILE`), tools/build.sh,
+  manifest.pdxsig (source-form, unsigned).
+- **remote#2** (M1-002): `src/kem.pdx` (`Module Kem`) -- ML-KEM-768 key
+  exchange over TCP using paideia-as's kernel-linked `MlKem768`
+  intrinsics. Client generates an ephemeral keypair, sends the
+  1184-byte encapsulation key, receives a 1088-byte ciphertext, and
+  decapsulates a 32-byte shared secret.
+- **remote#3** (M1-003): `src/channel.pdx` (`Module Channel`) -- a
+  ChaCha20-Poly1305 AEAD framed channel over the KEM session key, using
+  paideia-as's kernel-linked `ChaCha20Poly1305` intrinsics. Per-frame:
+  12-byte counter nonce, plaintext payload, 16-byte tag, 4-byte
+  big-endian length prefix.
+- **remote#4** (M1-004): `src/remote_client.pdx` (`Module RemoteClient`)
+  -- `remote <host>` binary. TCP connect to `<host>:22`, KEM handshake,
+  channel wrap, `AUTH_CHALLENGE` / `SPAWN_SHELL` opcodes, local tty
+  raw-mode bridge (stdin -> channel -> stdout pump).
+- **remote#5** (M1-005): `src/rcopy.pdx` (`Module Rcopy`) --
+  `rcopy <local> <host>:<remote>` binary. Same KEM+channel handshake;
+  sends a `COPY` request record (`{op, name_len, name_bytes, size,
+  sha256}`) then streams the source file in 4096-byte chunks, each
+  acknowledged by the server.
+
+Known gaps (see README.md "Known gaps at this landing"): KEM seed
+entropy is `rdtsc`-derived (not cryptographically strong) pending a
+linked CSPRNG intrinsic; `rcopy`'s `sha256` field is a documented
+32-zero-byte stub pending a linked `Sha256` primitive; tty raw mode
+fails closed pending a `KIND_TTY` loader-seed for non-shell processes;
+`<host>` must be a dotted-quad IPv4 literal (no resolver syscall
+exists yet).

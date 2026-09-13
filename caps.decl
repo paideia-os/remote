@@ -1,0 +1,69 @@
+# remote -- caps.decl
+#
+# Wave: SS (Wave SS 5-issue cohort)  Milestone: M1-001 (repo bootstrap)
+#
+# This repo ships two binaries out of one source tree:
+#   `remote` (src/remote_client.pdx, Module RemoteClient) -- authenticate
+#            + spawn a remote shell + tty bridge, over a TCP connection
+#            to <host>:22.
+#   `rcopy`  (src/rcopy.pdx, Module Rcopy) -- authenticate + stream a
+#            local file to <host>:<remote-path> over the same
+#            KEM+AEAD-wrapped channel (op-dispatch on one daemon port,
+#            no separate SCP-style port).
+#
+# Both share src/kem.pdx (Module Kem, ML-KEM-768 handshake) and
+# src/channel.pdx (Module Channel, ChaCha20-Poly1305 framed transport).
+# Neither shared module issues a syscall or cap-invoke of its own that
+# is not already covered by a row below -- both are called from within
+# the entry binaries' own stack frames, so the capability surface is
+# the union of what `remote` and `rcopy` each need, not a superset per
+# module.
+#
+# Format: `requires:` lists cap-kind names + narrowed rights + optional
+# scope, mirroring the discipline documented at tools/user/cp/caps.decl
+# (paideia-os repo) -- the caps-decl reader resolves each name to its
+# KIND_* ordinal at exec time and fails-fast on a mismatch between the
+# loader-seeded cap set and this list.
+requires:
+  # Identity root. KIND_USER = 0x190 (paideia-os R48.M1 substrate,
+  # src/kernel/core/cap/kind_user.pdx). Present on both binaries so the
+  # invoking user's identity is available to a future audit-journal
+  # correlation of remote-session start/end.
+  - KIND_USER (self)
+
+  # Network egress. The kernel's real cap-adjacent gate for the socket
+  # family is KIND_TCP_SOCKET (0x1AB, src/kernel/core/cap/kind.pdx
+  # R72.M1-006) -- there is no separate KIND_TCP_CONNECT ordinal in the
+  # kernel's kind table. This row declares KIND_TCP_SOCKET narrowed to
+  # the `connect` right against the caller-supplied <host> argument,
+  # which is the capability this repo's own design vocabulary calls
+  # "KIND_TCP_CONNECT" (M1-001 issue text). The two names describe the
+  # same authority; this file uses the real kernel ordinal so a future
+  # manifest reconciler does not fail on an unknown kind, and records
+  # the M1-001 vocabulary mapping here for provenance.
+  - KIND_TCP_SOCKET (connect, <host>)
+
+  # Interactive tty control. KIND_TTY = 0x197 (paideia-os R30-PREP
+  # substrate, src/kernel/core/cap/kind_tty.pdx). `remote` uses this to
+  # flip the local tty into raw mode (TTY_OP_SET_RAW / TTY_OP_SET_COOKED,
+  # ordinals 7/8) for the interactive shell bridge; `rcopy` declares the
+  # same row for symmetry with the shared Channel module's diagnostic
+  # writes but does not invoke SET_RAW.
+  #
+  # NOTE (known kernel-side gap, documented at tools/user/shell/src/
+  # line_reader.pdx lr_tty_set_raw): KIND_TTY is not yet in
+  # KIND_SEEDABLE_TABLE and no ring-3 process is seeded a KIND_TTY row
+  # at boot today (paideia-os design/architecture.md §3.3 items 3a/3b).
+  # This declaration is real and the call sites in src/remote_client.pdx
+  # are real cap_invoke calls -- but until a loader-side KIND_TTY seed
+  # lands for non-shell processes, `rc_tty_set_raw` fails closed
+  # (returns an error, the pump loop still runs over cooked-mode I/O)
+  # rather than silently no-op-ing. Same posture as cp's KIND_PDXFS_VOL
+  # declare-before-invoke row.
+  - KIND_TTY (invoke)
+
+  # Local filesystem access for `rcopy`'s source file. Narrowed to READ
+  # against the caller-supplied local path; the loader narrows the cap
+  # tail's subtree to the argument-path prefix at exec, matching cp's
+  # own KIND_PDXFS_FILE(read, <src>) discipline.
+  - KIND_PDXFS_FILE (read, <local-src>)

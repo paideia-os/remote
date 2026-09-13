@@ -1,0 +1,68 @@
+# remote — manifest.pdxsig
+#
+# Wave: SS  Milestone: M1 (v0.5.0, unsigned source-form release)
+#
+# Dual-signature block for `remote` + `rcopy` v0.5.0, in the same
+# line-oriented, diff-inspectable shape as tools/user/cp/manifest.pdxsig
+# and tools/user/pdxsock/manifest.pdxsig in the paideia-os monorepo.
+# `pkg install remote` will invoke `ml_dsa_65_verify` twice against
+# this file (once with `author_pk`, once with `paideia_root_pk`) once
+# the signing pipeline populates the two signature blocks below.
+#
+# This is a SOURCE-FORM manifest at the M1 landing: every `payload:`
+# line's hash is `<pending-build>` because paideia-as build has not
+# been invoked in-tree at this commit (IMPL-ONLY discipline for this
+# wave -- the build is run out-of-band by the integrating pipeline).
+# The signing pipeline replaces each `<pending-build>` with the
+# on-disk sha256 at release-tag time.
+
+package        = remote
+version        = 0.5.0
+release_date   = 2026-09-13
+paideia_as_min = 0.36
+kind           = tool
+
+# --- Release payload -------------------------------------------------
+# Two output binaries ship from this one manifest: `remote` (the
+# interactive shell client) and `rcopy` (the file-copy client). Both
+# link src/kem.o + src/channel.o alongside their own entry object.
+
+payload: build-out/remote                      <pending-build>
+payload: build-out/rcopy                       <pending-build>
+payload: caps.decl                             <pending-build>
+payload: CHANGELOG.md                          <pending-build>
+payload: LICENSE                               <pending-build>
+payload: README.md                             <pending-build>
+payload: src/kem.pdx                           <pending-build>
+payload: src/channel.pdx                       <pending-build>
+payload: src/remote_client.pdx                 <pending-build>
+payload: src/rcopy.pdx                         <pending-build>
+
+# --- Author signature block ------------------------------------------
+# Fingerprint format per `pkg keys` output: 32 hex chars of the
+# SHA-256 over the raw 1952-byte ML-DSA-65 public key, lowercased,
+# unspaced.
+
+author         = snunez
+author_pk_fp   = <pending-author-sign>
+author_sig     = <pending-author-sign>
+
+# --- Root signature block --------------------------------------------
+# The paideia signing bot re-signs after a reviewer confirms the
+# source-tree at the release tag matches the author's staged tarball.
+
+paideia_root_pk_fp = <pending-root-sign>
+paideia_root_sig   = <pending-root-sign>
+
+# --- Manifest hash ---------------------------------------------------
+# SHA-256 hex over the canonical concatenation of every `payload:`
+# line above (sorted alphabetically by path), one line per record,
+# separated by `\n`.
+
+manifest_hash  = <pending-build>
+
+# --- Release-flow gates (documentation-only) -------------------------
+release_gates:
+  m1_close_commit = <pending-tag>
+  changelog_v0_5  = true
+  readme_present  = true

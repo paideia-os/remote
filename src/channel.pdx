@@ -1,0 +1,444 @@
+// src/channel.pdx -- remote M1-003 (remote#3): encrypted channel over
+// ChaCha20-Poly1305, keyed by Kem::kem_client_handshake's shared secret.
+//
+// Module Channel: a framed AEAD transport wrapping a connected TCP
+// socket fd. Frame shape on the wire:
+//
+//   [4 bytes: big-endian u32 sealed_len] [sealed_len bytes: ciphertext || 16-byte tag]
+//
+// where sealed_len == plaintext_len + CH_TAG_LEN. The nonce for each
+// frame is NOT sent on the wire -- both peers derive it from a
+// per-direction monotonically-increasing counter plus a fixed
+// direction byte (see ch_build_nonce below), which is why exactly one
+// Channel per connection, initialised once via ch_init, must be used
+// for the lifetime of that connection.
+//
+// Nonce-space separation (why there is a "direction" byte)
+// ----------------------------------------------------------
+// ChaCha20-Poly1305 catastrophically fails if the SAME (key, nonce)
+// pair is ever reused (RFC 8439 §2.3). This channel uses one shared
+// 32-byte key for both directions (the raw ML-KEM-768 shared secret --
+// no HKDF-style per-direction sub-key split is available since no hash
+// primitive is linked yet; see README.md known gaps), so if both
+// directions numbered their nonces 0, 1, 2, ... independently, the
+// client's first sent frame and the client's first received frame
+// would use the IDENTICAL nonce under the IDENTICAL key -- a nonce
+// reuse. `ch_build_nonce` avoids this by reserving the nonce's top
+// byte as a direction tag: 0 for frames THIS process sends
+// (CH_DIR_TX), 1 for frames THIS process receives (CH_DIR_RX). Two
+// disjoint counters (ch_send_ctr, ch_recv_ctr) then never collide with
+// each other regardless of how many frames either side sends, as long
+// as each counter itself never wraps within one Channel's lifetime
+// (2^64 frames -- not a practical concern for an interactive shell or
+// file-copy session).
+//
+// A future server-side Channel (a `remoted` daemon, out of scope for
+// this client-only wave) uses the MIRRORED convention (CH_DIR_TX=1,
+// CH_DIR_RX=0) so that what the client tags "TX" the server decrypts
+// as its own "RX" and vice versa.
+//
+// Intrinsic linkage: same module-local trait-redeclaration discipline
+// as src/kem.pdx and tools/user/libpdx-volume/src/pdxb_crypto.pdx --
+// real kernel-linked ChaCha20Poly1305 intrinsic, not a WEAK stub (see
+// crates/paideia-as-stdlib/pdx/crypto/chacha20_poly1305.pdx).
+//
+// net_send_all / net_recv_all are NOT redefined here -- they live once
+// in src/kem.pdx and are cross-module `call`ed by bare name (see that
+// file's module header for why duplicating them would be a link-time
+// multiple-definition error).
+//
+// paideia-as compliance (v0.36+)
+// -------------------------------
+//   - Module Channel (PascalCase basename matches src/channel.pdx).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm <= 0x7FFFFFFF.
+//   - r11 is scratch for every lea against a .bss buffer.
+//   - No unsafe-block function here takes more than 4 curried params.
+//   - Reserved-label discipline: every branch label prefixed `ch_`.
+
+module Channel = structure {
+
+  // -- Frame / AEAD constants -------------------------------------------
+  pub let CH_KEY_LEN         : u64 = 32
+  pub let CH_NONCE_LEN       : u64 = 12
+  pub let CH_TAG_LEN         : u64 = 16
+  pub let CH_MAX_PLAINTEXT   : u64 = 4096   // matches rcopy's 4096-byte chunk size
+  pub let CH_MAX_SEALED      : u64 = 4112   // CH_MAX_PLAINTEXT + CH_TAG_LEN
+  pub let CH_LEN_PREFIX_LEN  : u64 = 4
+
+  pub let CH_DIR_TX : u64 = 0   // frames this process sends
+  pub let CH_DIR_RX : u64 = 1   // frames this process receives
+
+  // -- Status codes --------------------------------------------------------
+  pub let CH_OK              : u64 = 0
+  pub let CH_ERR_TOO_LARGE   : u64 = 1
+  pub let CH_ERR_SEAL        : u64 = 2
+  pub let CH_ERR_SEND        : u64 = 3
+  pub let CH_ERR_RECV_LEN    : u64 = 4
+  pub let CH_ERR_BAD_LEN     : u64 = 5
+  pub let CH_ERR_RECV_BODY   : u64 = 6
+  pub let CH_ERR_OPEN        : u64 = 7
+
+  // -- .bss scratch (single global, non-reentrant) -----------------------
+  pub let mut ch_key        : [u8; 32]   = uninit @align(8)
+  pub let mut ch_send_ctr   : u64        = 0
+  pub let mut ch_recv_ctr   : u64        = 0
+  pub let mut ch_nonce_buf  : [u8; 12]   = uninit @align(8)
+  pub let mut ch_send_buf   : [u8; 4112] = uninit @align(8)
+  pub let mut ch_recv_buf   : [u8; 4112] = uninit @align(8)
+  pub let mut ch_len_prefix : [u8; 4]    = uninit @align(8)
+  pub let mut ch_written    : u64        = 0
+
+  // AeadParamsC: key_ptr, nonce_ptr, aad_ptr, aad_len = 4 u64 slots = 32B.
+  pub let mut ch_aead_scratch : [u8; 32] = uninit @align(8)
+
+  // -------------------------------------------------------------------------
+  // Local trait declaration (module-local dispatch; see module header).
+  // -------------------------------------------------------------------------
+  trait ChaCha20Poly1305 {
+    fn seal(params: u64, plaintext_ptr: u64, plaintext_len: u64,
+            out_ptr: u64, out_cap: u64, written_ptr: u64)
+      -> i64 !{crypto, mem} @{paideia.crypto};
+    fn open(params: u64, sealed_ptr: u64, sealed_len: u64,
+            out_ptr: u64, out_cap: u64, written_ptr: u64)
+      -> i64 !{crypto, mem} @{paideia.crypto};
+  }
+
+  pub let ch_seal_raw : (u64, u64, u64, u64, u64, u64) -> i64 !{crypto, mem} @{paideia.crypto} =
+    fn (params: u64, plaintext_ptr: u64, plaintext_len: u64,
+        out_ptr: u64, out_cap: u64, written_ptr: u64) ->
+      ChaCha20Poly1305::seal(params, plaintext_ptr, plaintext_len,
+                              out_ptr, out_cap, written_ptr)
+
+  pub let ch_open_raw : (u64, u64, u64, u64, u64, u64) -> i64 !{crypto, mem} @{paideia.crypto} =
+    fn (params: u64, sealed_ptr: u64, sealed_len: u64,
+        out_ptr: u64, out_cap: u64, written_ptr: u64) ->
+      ChaCha20Poly1305::open(params, sealed_ptr, sealed_len,
+                              out_ptr, out_cap, written_ptr)
+
+  // =========================================================================
+  // ch_init(key_ptr) -> ()
+  //
+  // Copies 32 bytes from key_ptr (the KEM shared secret) into ch_key
+  // and resets both direction counters to 0. Must be called exactly
+  // once per connection, after Kem::kem_client_handshake succeeds and
+  // before any ch_send_frame / ch_recv_frame call.
+  // =========================================================================
+  pub let ch_init : (u64) -> () !{mem} @{} =
+    fn (key_ptr: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "remote#3: ch_init. Leaf; no push/pop parity needed (no nested calls). Byte-copy loop rbx=key_ptr (arg, but copied to rbx only for symmetry -- actually kept in rdi throughout since this is a leaf with no clobbering calls), r10=dst cursor via lea, r13=loop counter. 32-byte copy via xor rax,rax; mov_b rax,[rdi+r13]; lea r10,[r11+r13]; mov_b [r10],rax pattern (#1248 discipline), where r11 is re-derived to &ch_key each iteration is wasteful but simplest-correct; kept outside the loop instead (lea r11 once, index via r11+r13 per iteration -- r11 does not get clobbered by anything else in this leaf). Then zero ch_send_ctr and ch_recv_ctr via two more rip-relative stores. Reserved labels prefixed ch_init_.",
+      block: {
+        push r13;
+        xor r13, r13;
+
+        lea r11, [rip + ch_key];
+
+      ch_init_loop:
+        cmp r13, 32;
+        jge ch_init_key_done;
+
+        lea r10, [rdi + r13];
+        xor rax, rax;
+        mov_b rax, [r10];
+
+        lea r10, [r11 + r13];
+        mov_b [r10], rax;
+
+        add r13, 1;
+        jmp ch_init_loop;
+
+      ch_init_key_done:
+        pop r13;
+
+        xor rax, rax;
+        lea r11, [rip + ch_send_ctr];
+        mov [r11], rax;
+        lea r11, [rip + ch_recv_ctr];
+        mov [r11], rax;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // ch_build_nonce(ctr, direction, out_ptr) -> ()
+  //
+  // Packs a 12-byte nonce: bytes [0..8) = ctr (raw little-endian qword
+  // store), byte [8..12) = direction as a zero-extended u32 (only the
+  // low byte is ever nonzero given CH_DIR_TX/CH_DIR_RX are 0/1, but a
+  // full mov_d keeps the store natural-width). See module header for
+  // the nonce-space-separation rationale.
+  // =========================================================================
+  pub let ch_build_nonce : (u64, u64, u64) -> () !{mem} @{} =
+    fn (ctr: u64) (direction: u64) (out_ptr: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "remote#3: ch_build_nonce. Leaf, no nested calls, no push/pop needed. mov [rdi_arg=out_ptr... ] -- arguments arrive rdi=ctr, rsi=direction, rdx=out_ptr per the curried-3-arg SysV mapping. mov [rdx + 0], rdi stores the 8-byte counter (natural qword store, little-endian in memory matching x86_64's own byte order -- the nonce's byte layout does not need to match any external wire-format endianness since both this process's send and recv paths are the only consumers of ch_nonce_buf). mov_d [rdx + 8], rsi stores the low 4 bytes of direction. No labels.",
+      block: {
+        mov [rdx + 0], rdi;
+        mov_d [rdx + 8], rsi;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // ch_send_frame(fd, plaintext_ptr, plaintext_len) -> u64
+  //
+  // Seals plaintext_ptr[..plaintext_len] under the current send nonce,
+  // writes the 4-byte BE length prefix + sealed bytes to fd, and
+  // advances ch_send_ctr. Returns CH_OK or a CH_ERR_* status.
+  // =========================================================================
+  pub let ch_send_frame : (u64, u64, u64) -> u64 !{crypto, mem, sysreg} @{paideia.crypto, fs, cap} =
+    fn (fd: u64) (plaintext_ptr: u64) (plaintext_len: u64) -> unsafe {
+      effects: {crypto, mem, sysreg},
+      capabilities: {paideia.crypto, fs, cap},
+      justification: "remote#3: ch_send_frame. 3-push callee-save (rbx=fd, r12=plaintext_ptr, r13=plaintext_len) -- odd count from rsp%16==8 entry lands rsp%16==0 for every nested call, no extra pad needed. Guard: cmp r13,4096; jg fail(CH_ERR_TOO_LARGE). Build nonce: ch_build_nonce(ch_send_ctr, CH_DIR_TX=0, &ch_nonce_buf) -- ch_send_ctr loaded via lea+mov into rdi first. Populate ch_aead_scratch: [+0]=&ch_key, [+8]=&ch_nonce_buf, [+16]=0 (aad_ptr NULL), [+24]=0 (aad_len). Call ch_seal_raw(&ch_aead_scratch, plaintext_ptr, plaintext_len, &ch_send_buf, 4112, &ch_written); cmp rax,0; jne fail(CH_ERR_SEAL). Load ch_written (sealed_len) into r14 -- wait r14 needs preserving; instead re-derive it fresh via mov whenever needed since it is only read, not called-through. Build BE length prefix from sealed_len into ch_len_prefix via four mov_b byte-shift-extracts (shr by 24/16/8/0 then mov_b store -- no bswap mnemonic assumed available, so BE is composed byte-by-byte MSB-first). net_send_all(fd, &ch_len_prefix, 4) -> jne fail(CH_ERR_SEND). net_send_all(fd, &ch_send_buf, sealed_len) -> jne fail(CH_ERR_SEND). Increment ch_send_ctr by 1 via lea+mov+add+mov. Return CH_OK.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                    // fd
+        mov r12, rsi;                    // plaintext_ptr
+        mov r13, rdx;                    // plaintext_len
+
+        cmp r13, 4096;
+        jg ch_sf_fail_toolarge;
+
+        lea r11, [rip + ch_send_ctr];
+        mov rdi, [r11];
+        mov rsi, 0;                      // CH_DIR_TX
+        lea rdx, [rip + ch_nonce_buf];
+        call ch_build_nonce;
+
+        lea r11, [rip + ch_aead_scratch];
+        lea rax, [rip + ch_key];
+        mov [r11 + 0], rax;
+        lea rax, [rip + ch_nonce_buf];
+        mov [r11 + 8], rax;
+        xor rax, rax;
+        mov [r11 + 16], rax;             // aad_ptr = NULL
+        mov [r11 + 24], rax;             // aad_len = 0
+
+        mov rdi, r11;                    // params
+        mov rsi, r12;                    // plaintext_ptr
+        mov rdx, r13;                    // plaintext_len
+        lea rcx, [rip + ch_send_buf];
+        mov r8, 4112;                    // CH_MAX_SEALED
+        lea r9, [rip + ch_written];
+        call ch_seal_raw;
+        cmp rax, 0;
+        jne ch_sf_fail_seal;
+
+        // Compose the 4-byte big-endian length prefix from ch_written.
+        lea r11, [rip + ch_written];
+        mov r10, [r11];                  // r10 = sealed_len
+        lea r11, [rip + ch_len_prefix];
+
+        mov rax, r10;
+        shr rax, 24;
+        mov_b [r11 + 0], rax;
+        mov rax, r10;
+        shr rax, 16;
+        mov_b [r11 + 1], rax;
+        mov rax, r10;
+        shr rax, 8;
+        mov_b [r11 + 2], rax;
+        mov rax, r10;
+        mov_b [r11 + 3], rax;
+
+        mov rdi, rbx;
+        lea rsi, [rip + ch_len_prefix];
+        mov rdx, 4;
+        call net_send_all;
+        cmp rax, 0;
+        jne ch_sf_fail_send;
+
+        mov rdi, rbx;
+        lea rsi, [rip + ch_send_buf];
+        mov rdx, r10;
+        call net_send_all;
+        cmp rax, 0;
+        jne ch_sf_fail_send;
+
+        lea r11, [rip + ch_send_ctr];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        pop r13;
+        pop r12;
+        pop rbx;
+        xor rax, rax;                    // CH_OK
+        ret;
+
+      ch_sf_fail_toolarge:
+        pop r13;
+        pop r12;
+        pop rbx;
+        mov rax, 1;                      // CH_ERR_TOO_LARGE
+        ret;
+
+      ch_sf_fail_seal:
+        pop r13;
+        pop r12;
+        pop rbx;
+        mov rax, 2;                      // CH_ERR_SEAL
+        ret;
+
+      ch_sf_fail_send:
+        pop r13;
+        pop r12;
+        pop rbx;
+        mov rax, 3;                      // CH_ERR_SEND
+        ret
+      }
+    }
+
+  // =========================================================================
+  // ch_recv_frame(fd, out_ptr, out_cap, out_len_ptr) -> u64
+  //
+  // Reads one frame (4-byte BE length prefix + sealed bytes), opens it
+  // under the current receive nonce, writes the recovered plaintext to
+  // out_ptr (caller guarantees out_cap >= CH_MAX_PLAINTEXT), stores the
+  // plaintext length at out_len_ptr, and advances ch_recv_ctr. Returns
+  // CH_OK or a CH_ERR_* status; on any error, out_ptr / out_len_ptr are
+  // left untouched.
+  // =========================================================================
+  pub let ch_recv_frame : (u64, u64, u64, u64) -> u64 !{crypto, mem, sysreg} @{paideia.crypto, fs, cap} =
+    fn (fd: u64) (out_ptr: u64) (out_cap: u64) (out_len_ptr: u64) -> unsafe {
+      effects: {crypto, mem, sysreg},
+      capabilities: {paideia.crypto, fs, cap},
+      justification: "remote#3: ch_recv_frame. 4-push callee-save (rbx=fd, r12=out_ptr, r13=out_cap, r14=out_len_ptr) + sub rsp,8: entry rsp%16==8, four pushes (32B, even count) land back at rsp%16==8, pad -8 -> 0 for every nested call. net_recv_all(fd,&ch_len_prefix,4) -> jne fail(CH_ERR_RECV_LEN). Decode BE u32 from ch_len_prefix into r10 via four mov_b loads + shl/or composition (MSB-first: byte0<<24 | byte1<<16 | byte2<<8 | byte3). Guard 16 <= sealed_len <= 4112 else fail(CH_ERR_BAD_LEN) (16 is CH_TAG_LEN, the minimum sealed length for a zero-byte plaintext). net_recv_all(fd,&ch_recv_buf,sealed_len) -> jne fail(CH_ERR_RECV_BODY). ch_build_nonce(ch_recv_ctr, CH_DIR_RX=1, &ch_nonce_buf). Populate ch_aead_scratch identically to ch_send_frame but nonce direction differs. ch_open_raw(&ch_aead_scratch,&ch_recv_buf,sealed_len,out_ptr=r12,out_cap=r13,&ch_written) -> jne fail(CH_ERR_OPEN). Store ch_written into [r14] (out_len_ptr). Increment ch_recv_ctr. Return CH_OK.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // fd
+        mov r12, rsi;                    // out_ptr
+        mov r13, rdx;                    // out_cap
+        mov r14, rcx;                    // out_len_ptr
+
+        mov rdi, rbx;
+        lea rsi, [rip + ch_len_prefix];
+        mov rdx, 4;
+        call net_recv_all;
+        cmp rax, 0;
+        jne ch_rf_fail_recvlen;
+
+        lea r11, [rip + ch_len_prefix];
+        xor rax, rax;
+        mov_b rax, [r11 + 0];
+        shl rax, 24;
+        mov r10, rax;
+
+        xor rax, rax;
+        mov_b rax, [r11 + 1];
+        shl rax, 16;
+        or  r10, rax;
+
+        xor rax, rax;
+        mov_b rax, [r11 + 2];
+        shl rax, 8;
+        or  r10, rax;
+
+        xor rax, rax;
+        mov_b rax, [r11 + 3];
+        or  r10, rax;                    // r10 = sealed_len
+
+        cmp r10, 16;
+        jl ch_rf_fail_badlen;
+        cmp r10, 4112;
+        jg ch_rf_fail_badlen;
+
+        mov rdi, rbx;
+        lea rsi, [rip + ch_recv_buf];
+        mov rdx, r10;
+        call net_recv_all;
+        cmp rax, 0;
+        jne ch_rf_fail_recvbody;
+
+        lea r11, [rip + ch_recv_ctr];
+        mov rdi, [r11];
+        mov rsi, 1;                      // CH_DIR_RX
+        lea rdx, [rip + ch_nonce_buf];
+        call ch_build_nonce;
+
+        lea r11, [rip + ch_aead_scratch];
+        lea rax, [rip + ch_key];
+        mov [r11 + 0], rax;
+        lea rax, [rip + ch_nonce_buf];
+        mov [r11 + 8], rax;
+        xor rax, rax;
+        mov [r11 + 16], rax;
+        mov [r11 + 24], rax;
+
+        mov rdi, r11;
+        lea rsi, [rip + ch_recv_buf];
+        mov rdx, r10;
+        mov rcx, r12;
+        mov r8, r13;
+        lea r9, [rip + ch_written];
+        call ch_open_raw;
+        cmp rax, 0;
+        jne ch_rf_fail_open;
+
+        lea r11, [rip + ch_written];
+        mov rax, [r11];
+        mov [r14], rax;
+
+        lea r11, [rip + ch_recv_ctr];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        xor rax, rax;                    // CH_OK
+        ret;
+
+      ch_rf_fail_recvlen:
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        mov rax, 4;                      // CH_ERR_RECV_LEN
+        ret;
+
+      ch_rf_fail_badlen:
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        mov rax, 5;                      // CH_ERR_BAD_LEN
+        ret;
+
+      ch_rf_fail_recvbody:
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        mov rax, 6;                      // CH_ERR_RECV_BODY
+        ret;
+
+      ch_rf_fail_open:
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        mov rax, 7;                      // CH_ERR_OPEN
+        ret
+      }
+    }
+}

@@ -1,0 +1,414 @@
+// src/remote_client.pdx -- remote M1-004 (remote#4): `remote <host>`.
+//
+// Module RemoteClient: entry point (`_start`) for the `remote` binary.
+// TCP-connects to <host>:22 (an SSH-shaped port), runs the ML-KEM-768
+// handshake (Kem::kem_client_handshake, src/kem.pdx), wraps the
+// connection in a ChaCha20-Poly1305 framed channel (Channel::ch_init /
+// ch_send_frame / ch_recv_frame, src/channel.pdx), authenticates, asks
+// the (out-of-scope, future) server to spawn a shell, and bridges the
+// local tty to it.
+//
+// Usage: `remote <host>` where <host> is a dotted-quad IPv4 literal
+// (no resolver syscall exists in this kernel yet -- see README.md).
+//
+// Wire protocol (application layer, carried inside Channel frames)
+// -------------------------------------------------------------------
+//   Client -> server: 1-byte opcode frame RC_OP_AUTH_CHALLENGE (1).
+//   Server -> client: 1-byte status frame (RC_STATUS_OK=0 / other=fail).
+//   Client -> server (on OK): 1-byte opcode frame RC_OP_SPAWN_SHELL (2).
+//   Server -> client: 1-byte status frame.
+//   Then: raw byte pump, stdin -> channel -> (remote pty) and
+//   channel -> stdout, one alternation-cycle at a time (see the pump
+//   loop's own header note on why this is not yet a real poll-driven
+//   full-duplex pump).
+//
+// paideia-as compliance (v0.36+)
+// -------------------------------
+//   - Module RemoteClient (PascalCase basename matches
+//     src/remote_client.pdx).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm <= 0x7FFFFFFF.
+//   - r11 is scratch for every lea against a .bss buffer.
+//   - No unsafe-block function here takes more than 4 curried params.
+//   - Reserved-label discipline: every branch label prefixed `rc_`.
+//   - IPv4 decimal parsing uses the shl-3/add/add *10 idiom (no 2-op
+//     imul): `mov r10, acc; shl acc, 3; add acc, r10; add acc, r10`.
+
+module RemoteClient = structure {
+
+  pub let RC_PORT : u64 = 22
+
+  pub let RC_OP_AUTH_CHALLENGE : u64 = 1
+  pub let RC_OP_SPAWN_SHELL    : u64 = 2
+  pub let RC_STATUS_OK         : u64 = 0
+
+  // Cap slot 2: KIND_TTY, resolved by the loader from caps.decl's
+  // declaration order (0=KIND_USER, 1=KIND_TCP_SOCKET, 2=KIND_TTY,
+  // 3=KIND_PDXFS_FILE). See caps.decl's KIND_TTY row header for the
+  // documented kernel-side gap (no non-shell KIND_TTY seed today) --
+  // rc_tty_set_raw is a REAL cap_invoke call site, but is expected to
+  // fail closed until that loader-side gap closes; the pump loop below
+  // still runs (over cooked-mode tty I/O) on that failure.
+  pub let RC_TTY_CAP_SLOT     : u64 = 2
+  pub let TTY_OP_SET_RAW      : u64 = 7
+  pub let TTY_OP_SET_COOKED   : u64 = 8
+  pub let SYS_CAP_INVOKE      : u64 = 4
+
+  pub let SYS_SOCKET  : u64 = 87
+  pub let SYS_CONNECT : u64 = 91
+  pub let SYS_READ    : u64 = 0
+  pub let SYS_WRITE   : u64 = 1
+  pub let SYS_EXIT     : u64 = 60
+  pub let AF_INET      : u64 = 2
+  pub let SOCK_STREAM  : u64 = 1
+
+  pub let RC_IP_PARSE_FAIL : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // -- .bss scratch --------------------------------------------------------
+  pub let mut rc_shared_secret : [u8; 32]   = uninit @align(8)
+  pub let mut rc_msg_buf       : [u8; 4096] = uninit @align(8)
+  pub let mut rc_msg_len       : u64        = 0
+
+  pub let rc_usage_msg : [u8; 21] = "usage: remote <host>\n"
+  pub let rc_err_connect_msg : [u8; 23] = "remote: connect failed\n"
+  pub let rc_err_kem_msg     : [u8; 29] = "remote: kem handshake failed\n"
+  pub let rc_err_auth_msg    : [u8; 21] = "remote: auth refused\n"
+
+  // =========================================================================
+  // rc_parse_ipv4(str_ptr) -> u64
+  //
+  // Parses a NUL-terminated dotted-quad "a.b.c.d" string into a packed
+  // u32 (bits [31:24]=a ... [7:0]=d, matching sys_connect's remote_ip
+  // ABI -- see src/kernel/core/syscall/handlers/sys_connect.pdx header).
+  // Returns RC_IP_PARSE_FAIL (all 64 bits set) on any malformed input;
+  // a valid packed IP never exceeds 32 bits so the two are always
+  // distinguishable.
+  // =========================================================================
+  pub let rc_parse_ipv4 : (u64) -> u64 !{mem} @{} =
+    fn (str_ptr: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "remote#4: rc_parse_ipv4. 5-push callee-save (rbx=str_ptr cursor, r12=octet index 0..3, r13=packed result accumulator, r14=current octet value, r15=digit count for the current octet) -- an odd count of pushes from an rsp%16==8 entry lands exactly on 0, so no extra pad is needed (no nested CALLs occur in this leaf-loop function anyway). Outer loop over 4 octets: inner loop reads decimal digits via xor rax,rax; mov_b rax,[rbx]; cmp rax,0x30; jl end-of-digits; cmp rax,0x39; jg end-of-digits; sub rax,0x30 (digit value); r14 = r14*10 + digit via the shl-3/add/add idiom (mov r10,r14; shl r14,3; add r14,r10; add r14,r10; add r14,digit); inc rbx; r15 counts digits consumed (guards against an empty octet). After digits: cmp r15,0; je fail (no digits at all); cmp r14,255; jg fail (octet out of range). Shift r13 left 8 and or in r14 (r13 = (r13<<8)|r14) -- for octets 0..2 the next char must be '.', consumed via inc rbx after checking cmp rax,0x2E; for octet 3 the next char must be NUL (0x00), checked the same way but jne fail instead of expecting a dot. add r12,1; loop 4 times. Final r13 holds the packed u32 in its low 32 bits (upper 32 always zero since each octet occupies exactly 8 bits and only 4 shifts total occur), returned in rax. All cmp reg,imm immediates (0x30,0x39,255,0x2E,4,3,0) are <= 0x7FFFFFFF. Reserved labels prefixed rc_ip_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                    // cursor
+        xor r12, r12;                    // octet index
+        xor r13, r13;                    // packed result
+
+      rc_ip_octet_loop:
+        cmp r12, 4;
+        jge rc_ip_done;
+
+        xor r14, r14;                    // octet value
+        xor r15, r15;                    // digit count (must be >= 1)
+
+      rc_ip_digit_loop:
+        xor rax, rax;
+        mov_b rax, [rbx];
+
+        cmp rax, 0x30;
+        jl rc_ip_digits_end;
+        cmp rax, 0x39;
+        jg rc_ip_digits_end;
+
+        sub rax, 0x30;                   // digit value 0..9
+        mov r10, r14;
+        shl r14, 3;
+        add r14, r10;
+        add r14, r10;                    // r14 = old_r14 * 10
+        add r14, rax;                    // r14 += digit
+
+        add r15, 1;
+        add rbx, 1;
+        jmp rc_ip_digit_loop;
+
+      rc_ip_digits_end:
+        cmp r15, 0;
+        je rc_ip_fail;
+
+        cmp r14, 255;
+        jg rc_ip_fail;
+
+        shl r13, 8;
+        or  r13, r14;
+
+        cmp r12, 3;
+        je rc_ip_expect_nul;
+
+        // Expect '.' separator.
+        cmp rax, 0x2E;
+        jne rc_ip_fail;
+        add rbx, 1;
+        jmp rc_ip_next_octet;
+
+      rc_ip_expect_nul:
+        cmp rax, 0;
+        jne rc_ip_fail;
+
+      rc_ip_next_octet:
+        add r12, 1;
+        jmp rc_ip_octet_loop;
+
+      rc_ip_done:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        mov rax, r13;
+        ret;
+
+      rc_ip_fail:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // rc_tty_set_raw() -> u64 / rc_tty_set_cooked() -> u64
+  //
+  // sys_cap_invoke(RC_TTY_CAP_SLOT, TTY_OP_SET_RAW|SET_COOKED). Real
+  // call sites; see the RC_TTY_CAP_SLOT constant doc for the known
+  // loader-side gap. Callers treat a nonzero return as "raw mode not
+  // available" and fall back to running the pump loop over cooked I/O.
+  // =========================================================================
+  pub let rc_tty_set_raw : () -> u64 !{sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {sysreg},
+      capabilities: {cap},
+      justification: "remote#4: rc_tty_set_raw. Leaf; SYSCALL clobbers rcx/r11 only (both caller-save, no preservation needed). mov rdi,2 (RC_TTY_CAP_SLOT); mov rsi,7 (TTY_OP_SET_RAW); mov rax,4 (SYS_CAP_INVOKE); syscall. The op_arg fused-qword bit layout for VMIN/VTIME/ECHO beyond the bare op ordinal is not yet pinned down in any available design doc (shell's own line_reader.pdx explicitly declines to spell it until its sys_cap_invoke wrapper lands) -- this call passes the bare op ordinal (7) with no extra packed bits, which is the only documented-safe shape today. Return value passed through verbatim.",
+      block: {
+        mov rdi, 2;
+        mov rsi, 7;
+        mov rax, 4;
+        syscall;
+        ret
+      }
+    }
+
+  pub let rc_tty_set_cooked : () -> u64 !{sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {sysreg},
+      capabilities: {cap},
+      justification: "remote#4: rc_tty_set_cooked. Symmetric peer of rc_tty_set_raw using TTY_OP_SET_COOKED=8. Leaf; SYSCALL clobbers rcx/r11 only.",
+      block: {
+        mov rdi, 2;
+        mov rsi, 8;
+        mov rax, 4;
+        syscall;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // rc_fail(msg_ptr, msg_len) -> ()   [never returns; sys_exit(1)]
+  // =========================================================================
+  pub let rc_fail : (u64, u64) -> () !{mem, sysreg} @{fs} =
+    fn (msg_ptr: u64) (msg_len: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs},
+      justification: "remote#4: rc_fail. sys_write(2, msg_ptr, msg_len) then sys_exit(1). This is an ORDINARY called function (reached via `call rc_fail`, not the process entry point), so per the shell/src/builtins.pdx bi_exit precedent it still ends in `ret` (not `hlt`) and carries NO `@no_frame` -- paideia-as requires every function block to end in a return-shaped instruction, and @no_frame is reserved for the true ELF entry point (_start) which has no return address on the stack to begin with. The trailing `ret` here is unreachable dead code (sys_exit terminates the task first) but satisfies that terminator-shape requirement, exactly like bi_exit's own documented `add rsp,8; xor rax,rax; ret` tail. SysV shuffle: rdi=msg_ptr, rsi=msg_len arrive from the caller; sys_write wants rdi=fd, rsi=buf, rdx=len, so: mov r10,rdi (save msg_ptr); mov rdx,rsi (len); mov rdi,2 (fd); mov rsi,r10 (buf); mov rax,1; syscall; mov rdi,1; mov rax,60; syscall; ret.",
+      block: {
+        mov r10, rdi;
+        mov rdx, rsi;
+        mov rdi, 2;
+        mov rsi, r10;
+        mov rax, 1;
+        syscall;
+
+        mov rdi, 1;
+        mov rax, 60;
+        syscall;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // _start -- remote entry point. execve ABI: rdi=argc, rsi=argv,
+  // rdx=envp, rsp%16==0 at entry (design/user/execve-abi.md).
+  // =========================================================================
+  pub let _start : () -> () !{crypto, mem, sysreg} @{paideia.crypto, fs, cap, sched} =
+    fn () -> unsafe {
+      effects: {crypto, mem, sysreg},
+      capabilities: {paideia.crypto, fs, cap, sched},
+      justification: "remote#4: _start real body. execve ABI entry has rsp%16==0 (design/user/execve-abi.md), NOT the rsp%16==8 every OTHER (CALL-invoked) function in this file assumes. 4-push callee-save (rbx=argc, r12=argv, r13=fd, r14=parsed remote_ip) and NO alignment pad: an EVEN count of 8-byte pushes from a 0-aligned entry lands back on 0, which is exactly the alignment every nested `call` site in this function needs immediately before it executes (rc_parse_ipv4, kem_client_handshake, ch_init, ch_send_frame x2, ch_recv_frame x3, rc_tty_set_raw, rc_tty_set_cooked, rc_fail x4). Flow: (1) cmp rdi,2; jne usage-fail. (2) load argv[1] via [rsi+8] (argv is a char*[]; argv[0]=program name, argv[1]=host) into rdi, call rc_parse_ipv4; cmp rax,imm-sentinel-staged-via-movabs; je usage-fail. (3) sys_socket(AF_INET=2,SOCK_STREAM=1,0) SC+87; cmp rax,0; jl connect-fail. mov r13,rax (fd). (4) sys_connect(r13, parsed_ip, 22) SC+91; cmp rax,0; jl connect-fail. (5) call kem_client_handshake(r13, &rc_shared_secret); cmp rax,0; jne kem-fail. (6) call ch_init(&rc_shared_secret). (7) build+send AUTH_CHALLENGE frame, recv status frame, check OK; on fail jmp auth-fail. (8) build+send SPAWN_SHELL frame, recv status frame, check OK; on fail jmp auth-fail. (9) call rc_tty_set_raw (return value ignored per the documented fail-closed gap -- the pump loop runs regardless). (10) pump loop: sys_read(0,&rc_msg_buf,4096) SC+0; cmp rax,0; jle pump-done (EOF or error ends the session); mov rdx,rax (n); ch_send_frame(r13,&rc_msg_buf,rdx); cmp rax,0; jne pump-done; ch_recv_frame(r13,&rc_msg_buf,4096,&rc_msg_len); cmp rax,0; jne pump-done; sys_write(1,&rc_msg_buf,[rc_msg_len]) SC+1; jmp pump loop. (11) pump-done: call rc_tty_set_cooked (ignored); sys_exit(0) SC+60. Every cmp reg,imm <= 4096. Reserved labels prefixed rc_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        mov rbx, rdi;                    // argc
+        mov r12, rsi;                    // argv
+
+        cmp rbx, 2;
+        jne rc_start_usage_fail;
+
+        mov rdi, [r12 + 8];              // argv[1]
+        call rc_parse_ipv4;
+
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je rc_start_usage_fail;
+
+        mov r14, rax;                    // parsed ip (32 bits valid)
+
+        mov rdi, 2;                      // AF_INET
+        mov rsi, 1;                      // SOCK_STREAM
+        mov rdx, 0;
+        mov rax, 87;                     // SYS_SOCKET
+        syscall;
+        cmp rax, 0;
+        jl rc_start_connect_fail;
+
+        mov r13, rax;                    // fd
+
+        mov rdi, r13;
+        mov rsi, r14;                    // remote_ip
+        mov rdx, 22;                     // RC_PORT
+        mov rax, 91;                     // SYS_CONNECT
+        syscall;
+        cmp rax, 0;
+        jl rc_start_connect_fail;
+
+        mov rdi, r13;
+        lea rsi, [rip + rc_shared_secret];
+        call kem_client_handshake;
+        cmp rax, 0;
+        jne rc_start_kem_fail;
+
+        lea rdi, [rip + rc_shared_secret];
+        call ch_init;
+
+        // -- AUTH_CHALLENGE ---------------------------------------------
+        lea r11, [rip + rc_msg_buf];
+        mov rax, 1;                      // RC_OP_AUTH_CHALLENGE
+        mov_b [r11], rax;
+
+        mov rdi, r13;
+        lea rsi, [rip + rc_msg_buf];
+        mov rdx, 1;
+        call ch_send_frame;
+        cmp rax, 0;
+        jne rc_start_auth_fail;
+
+        mov rdi, r13;
+        lea rsi, [rip + rc_msg_buf];
+        mov rdx, 4096;
+        lea rcx, [rip + rc_msg_len];
+        call ch_recv_frame;
+        cmp rax, 0;
+        jne rc_start_auth_fail;
+
+        lea r11, [rip + rc_msg_buf];
+        xor rax, rax;
+        mov_b rax, [r11];
+        cmp rax, 0;                      // RC_STATUS_OK
+        jne rc_start_auth_fail;
+
+        // -- SPAWN_SHELL --------------------------------------------------
+        lea r11, [rip + rc_msg_buf];
+        mov rax, 2;                      // RC_OP_SPAWN_SHELL
+        mov_b [r11], rax;
+
+        mov rdi, r13;
+        lea rsi, [rip + rc_msg_buf];
+        mov rdx, 1;
+        call ch_send_frame;
+        cmp rax, 0;
+        jne rc_start_auth_fail;
+
+        mov rdi, r13;
+        lea rsi, [rip + rc_msg_buf];
+        mov rdx, 4096;
+        lea rcx, [rip + rc_msg_len];
+        call ch_recv_frame;
+        cmp rax, 0;
+        jne rc_start_auth_fail;
+
+        lea r11, [rip + rc_msg_buf];
+        xor rax, rax;
+        mov_b rax, [r11];
+        cmp rax, 0;
+        jne rc_start_auth_fail;
+
+        // -- raw mode (best-effort) ---------------------------------------
+        call rc_tty_set_raw;
+
+      rc_start_pump_loop:
+        mov rdi, 0;                      // stdin
+        lea rsi, [rip + rc_msg_buf];
+        mov rdx, 4096;
+        mov rax, 0;                      // SYS_READ
+        syscall;
+        cmp rax, 0;
+        jle rc_start_pump_done;
+
+        mov rdi, r13;
+        lea rsi, [rip + rc_msg_buf];
+        mov rdx, rax;                    // n bytes read
+        call ch_send_frame;
+        cmp rax, 0;
+        jne rc_start_pump_done;
+
+        mov rdi, r13;
+        lea rsi, [rip + rc_msg_buf];
+        mov rdx, 4096;
+        lea rcx, [rip + rc_msg_len];
+        call ch_recv_frame;
+        cmp rax, 0;
+        jne rc_start_pump_done;
+
+        lea r11, [rip + rc_msg_len];
+        mov rdx, [r11];
+        mov rdi, 1;                      // stdout
+        lea rsi, [rip + rc_msg_buf];
+        mov rax, 1;                      // SYS_WRITE
+        syscall;
+
+        jmp rc_start_pump_loop;
+
+      rc_start_pump_done:
+        call rc_tty_set_cooked;
+
+        mov rdi, 0;
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      rc_start_usage_fail:
+        lea rdi, [rip + rc_usage_msg];
+        mov rsi, 21;
+        call rc_fail;
+        hlt;
+
+      rc_start_connect_fail:
+        lea rdi, [rip + rc_err_connect_msg];
+        mov rsi, 23;
+        call rc_fail;
+        hlt;
+
+      rc_start_kem_fail:
+        lea rdi, [rip + rc_err_kem_msg];
+        mov rsi, 29;
+        call rc_fail;
+        hlt;
+
+      rc_start_auth_fail:
+        lea rdi, [rip + rc_err_auth_msg];
+        mov rsi, 21;
+        call rc_fail;
+        hlt
+      }
+    } @no_frame
+}
