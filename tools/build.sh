@@ -82,6 +82,36 @@ echo "[build] OK"
 KEM_OBJ="$BUILD_DIR/kem.o"
 CHANNEL_OBJ="$BUILD_DIR/channel.o"
 
+# ---------------------------------------------------------------------------
+# KNOWN PRE-EXISTING LINK FAILURE -- paideia_crypto_* undefined symbols
+# ---------------------------------------------------------------------------
+# src/channel.pdx and src/kem.pdx elaborate paideia-as stdlib crypto ops
+# (chacha20_poly1305 seal/open, ml_kem_768 keygen) down to extern calls
+# against:
+#
+#   paideia_crypto_chacha20_poly1305_seal
+#   paideia_crypto_ml_kem_768_keygen
+#
+# (and their sibling open/encaps/decaps entry points). These symbols are
+# defined in the paideia-as satellite crypto runtime archive, NOT in any
+# object this script compiles, so the `ld` step below fails undefined-symbol
+# for any satellite tool that actually calls into `crypto`/`paideia.crypto`
+# -- see design/link-recipe.md for the full writeup.
+#
+# Fix (not yet applied here -- documenting the recipe, see design doc for
+# why this repo does not hardcode a path):
+#
+#   ld -nostdlib --warn-common --fatal-warnings --gc-sections \
+#       -T link.ld \
+#       -o "$BUILD_DIR/$name.elf" \
+#       "$entry_obj" "$KEM_OBJ" "$CHANNEL_OBJ" \
+#       --extra-archive /path/to/libpaideia_satellite_runtime.a
+#
+# where /path/to/libpaideia_satellite_runtime.a is built by the paideia-as
+# toolchain at:
+#   <paideia-os checkout>/tools/paideia-as/target/release/libpaideia_satellite_runtime.a
+# ---------------------------------------------------------------------------
+
 link_bin() {
     local name="$1"
     local entry_obj="$2"
