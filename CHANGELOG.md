@@ -2,7 +2,41 @@
 
 All notable changes to `remote` are documented in this file.
 
-## [Unreleased] - R85 closure
+## [0.6.0] - 2026-09-14 - Wave mu-05 audit + encaps parity (remote#8)
+
+### Audit finding
+
+Wave mu-05's project-wide plan described this repo's `src/kem.pdx` as
+"currently WEAK deterministic-key stub" needing to be "replace[d]
+with real paideia_crypto_ml_kem_768_keypair/encaps/decaps intrinsic
+calls". That characterization was already stale: remote#2 (v0.5.0)
+had already landed REAL kernel-linked `MlKem768::keygen`/`::decaps`
+trait calls (`kem_keygen_raw`/`kem_decaps_raw`) -- not a deterministic
+stub. No client-side key-generation or decapsulation code needed
+replacing.
+
+### Added
+
+- **`kem_encaps_raw(ek_ptr, seed_m_ptr, ct_out_ptr, ss_out_ptr)`**
+  (`src/kem.pdx`) -- a real `MlKem768::encaps` trait-call wrapper, for
+  parity with the pre-existing `kem_keygen_raw`/`kem_decaps_raw` and
+  fulfilling this file's own forward-reference to a future `remoted`
+  daemon's server-role needs. Still unused by `remote`/`rcopy`'s
+  client-only binaries (encapsulation is the SERVER's step in this
+  protocol shape) -- exported so a future daemon module has an
+  already-proven call surface.
+
+### Known gaps (unchanged)
+
+- Seed entropy (`kem_fill_seed_bytes`) still derives from an
+  `rdtsc`-mixed splitmix64-adjacent avalanche, NOT a CSPRNG -- no
+  `SecureRandom`/`rdrand`/`rdseed` primitive exists in the paideia-as
+  stdlib or encoder as of this audit. This remains the one real
+  security gap in the KEM path (tracked since remote#2); everything
+  else in the handshake (keygen, encaps trait declaration, decaps) now
+  runs through real kernel-linked intrinsics.
+
+### Also included (R85 closure, previously unreleased)
 
 - **remote#6** (M1-006): connection-success fingerprint. `src/kem.pdx`
   gains `kem_hex_nibble` / `kem_hash_to_hex8` / `kem_peer_key_hash64`

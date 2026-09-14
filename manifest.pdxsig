@@ -17,8 +17,8 @@
 # on-disk sha256 at release-tag time.
 
 package        = remote
-version        = 0.5.0
-release_date   = 2026-09-13
+version        = 0.6.0
+release_date   = 2026-09-14
 paideia_as_min = 0.36
 kind           = tool
 

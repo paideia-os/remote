@@ -35,9 +35,21 @@
 // below (`_encaps` is unused here -- see the client-only note).
 //
 // Client-only scope: `encaps` is the SERVER's step, not the client's,
-// so this file declares the trait method for completeness/documentation
-// but only wires `keygen` + `decaps` into callable wrappers. A future
-// `remoted` daemon module would add its own `kem_encaps_raw` wrapper.
+// so `kem_client_handshake` (this file's only orchestration entry
+// point) never calls `kem_encaps_raw`. Wave mu-05 (remote#8) adds the
+// wrapper itself, for trait-call parity with `kem_keygen_raw` /
+// `kem_decaps_raw` and so a future `remoted` daemon module has a
+// stable, already-proven call surface to reach for -- it remains
+// unused by `remote`/`rcopy`'s client-only binaries.
+//
+// Wave mu-05 audit note: this module was flagged in a project-wide
+// wave plan as "currently WEAK deterministic-key stub"; that
+// characterization was already stale by the time the wave ran --
+// remote#2 (v0.5.0) landed the REAL kernel-linked MlKem768::keygen/
+// decaps trait calls below, not a stub. The only remaining honest gap
+// is the seed ENTROPY source (kem_fill_seed_bytes, below), which is
+// unrelated to keygen/decaps being real -- see that function's own
+// header caveat.
 //
 // SECURITY CAVEAT -- seed entropy (tracked as a known gap; see README.md)
 // -------------------------------------------------------------------
@@ -449,6 +461,18 @@ module Kem = structure {
   pub let kem_decaps_raw : (u64, u64, u64) -> i64 !{crypto, mem} @{paideia.crypto} =
     fn (dk_ptr: u64, ct_ptr: u64, ss_out_ptr: u64) ->
       MlKem768::decaps(dk_ptr, ct_ptr, ss_out_ptr)
+
+  // Wave mu-05 (remote#8): server-role trait-call wrapper for parity
+  // with kem_keygen_raw/kem_decaps_raw, fulfilling this file's own
+  // forward-reference ("A future remoted daemon module would add its
+  // own kem_encaps_raw wrapper" -- see module header). Still UNUSED by
+  // this client-only binary (encapsulation is the SERVER's step, per
+  // the module header's wire-shape description) -- exported so a
+  // future `remoted` daemon module can call it without touching this
+  // file again.
+  pub let kem_encaps_raw : (u64, u64, u64, u64) -> i64 !{crypto, mem} @{paideia.crypto} =
+    fn (ek_ptr: u64, seed_m_ptr: u64, ct_out_ptr: u64, ss_out_ptr: u64) ->
+      MlKem768::encaps(ek_ptr, seed_m_ptr, ct_out_ptr, ss_out_ptr)
 
   // =========================================================================
   // net_send_all(fd, ptr, len) -> u64   (0 = OK, 1 = error)

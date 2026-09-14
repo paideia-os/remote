@@ -1,10 +1,19 @@
 # remote -- status
 
 **Round:** R85 -- ssh/remote secure shell
-**Current milestone:** M1-008 round closure (remote#7) -- **R85 CLOSED, tag `r85-closed`**
-**Version:** 0.5.0 (Wave SS landed the whole M1 milestone in one tagged
-commit; this closure lands M1-006/M1-007/M1-008 without a version
-bump -- see CHANGELOG.md `[Unreleased]`.)
+**Current milestone:** Wave mu-05 audit + encaps parity (remote#8)
+**Version:** 0.6.0 (folds the R85-closure M1-006/M1-007/M1-008 work,
+previously landed without a version bump, plus this wave's audit
+finding + `kem_encaps_raw` parity wrapper -- see CHANGELOG.md.)
+
+## Wave mu-05 audit finding
+
+A project-wide wave plan described `src/kem.pdx` as "currently WEAK
+deterministic-key stub" needing real ML-KEM intrinsic calls. That was
+stale: remote#2 (v0.5.0) already landed REAL kernel-linked
+`MlKem768::keygen`/`::decaps` trait calls. This landing (remote#8)
+corrects the record and adds `kem_encaps_raw` for trait-call parity;
+see CHANGELOG.md `[0.6.0]` for the full finding.
 
 See `design/roadmap/post-r60-daily-use-roadmap.md` §R85 (paideia-os
 monorepo) for the full spec.
