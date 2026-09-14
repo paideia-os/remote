@@ -59,4 +59,23 @@ Both binaries share two library modules:
   be a dotted-quad IPv4 literal (`a.b.c.d`), matching every other
   networked user tool in this ecosystem (`pdxsock`).
 
+## Connection-success fingerprint (`remote#6`)
+
+On a successful `Kem::kem_client_handshake`, `remote` writes
+`remote ok host=<H> peer_key=<hex8>\n` to fd 2. Two design notes:
+
+- **"peer's public key" reading.** This protocol's client never
+  receives a public key back from the server (only a ciphertext it
+  decapsulates locally -- see `src/kem.pdx`'s module header). The only
+  ML-KEM public key material that exists client-side is `kem_ek`, the
+  encapsulation key this client generated and sent to the peer;
+  `peer_key` hashes that. A real server-side peer would see the same
+  `ek` bytes cross the wire, so this is the closest available reading
+  of "peer's public key" given this round's client-only scope.
+- **No hash primitive is linked.** `kem_peer_key_hash64` is Jenkins'
+  one-at-a-time hash (public-domain, non-cryptographic) run natively
+  in a 64-bit register (`add`/`xor`/`shl`/`shr` only -- no `imul`, no
+  `and reg, imm64` truncation risk). This is a greppable log
+  fingerprint, not a security property.
+
 See `CHANGELOG.md` for the per-issue landing history.

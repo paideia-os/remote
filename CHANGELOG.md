@@ -2,6 +2,19 @@
 
 All notable changes to `remote` are documented in this file.
 
+## [Unreleased] - R85 closure
+
+- **remote#6** (M1-006): connection-success fingerprint. `src/kem.pdx`
+  gains `kem_hex_nibble` / `kem_hash_to_hex8` / `kem_peer_key_hash64`
+  (Jenkins one-at-a-time, non-cryptographic -- no hash primitive is
+  linked yet) / `kem_peer_key_fingerprint_hex`. `RemoteClient::_start`
+  emits `remote ok host=<H> peer_key=<hex8>\n` to fd 2 right after
+  `kem_client_handshake` succeeds, hashing `kem_ek` (the only ML-KEM
+  public key material available client-side in this protocol shape --
+  see README.md design note).
+- **remote#7** (M1-008): round closure -- `STATUS.md` +
+  `design/round-retrospectives/r85-closure.md`; `r85-closed` tag.
+
 ## [0.5.0] - 2026-09-13
 
 Wave SS 5-issue cohort -- initial landing of the whole M1 milestone in

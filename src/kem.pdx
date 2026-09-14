@@ -187,6 +187,246 @@ module Kem = structure {
       }
     }
 
+  // =========================================================================
+  // remote#6 (M1-006): connection-success fingerprint helpers.
+  //
+  // "remote ok host=<H> peer_key=<hex8>" needs an 8-hex-char stand-in
+  // for "the peer's ML-KEM public key" -- but in THIS protocol shape
+  // the client never receives a public key back from the server (only
+  // a ciphertext, decapsulated client-side; see module header). The
+  // only ML-KEM public key material that ever exists in this process
+  // is kem_ek itself: the encapsulation key THIS client generated and
+  // sent to the peer. Both ends of a real session would see the same
+  // ek bytes cross the wire, so hashing kem_ek gives a value a human
+  // operator could compare against a future server-side log line for
+  // the same session -- the closest available reading of "peer_key"
+  // given this landing's client-only scope. Tracked as a design note
+  // in README.md alongside the other known gaps.
+  //
+  // No hash primitive is linked in the paideia-as stdlib (crypto/ ships
+  // argon2id, chacha20_poly1305, ml_kem_768 only -- see rc_sha256_stub
+  // in src/rcopy.pdx for the same gap). kem_peer_key_hash64 is
+  // therefore Jenkins' one-at-a-time hash (a well-known, NON-
+  // cryptographic string hash) run natively over a 64-bit register:
+  // every step is add/xor/shl/shr, so 64-bit register wraparound IS
+  // the modular reduction (no explicit masking, no imul, and no
+  // `and reg, imm64` sign-extension pitfall -- see kem_hash_to_hex8's
+  // own note on why `and reg, 0xF` is safe where a wider mask would
+  // not be). This is a fingerprint for greppable logs, not a security
+  // boundary: collisions are expected and harmless here.
+  // =========================================================================
+
+  // =========================================================================
+  // kem_hex_nibble(nibble) -> u64
+  //
+  // ASCII hex digit (lowercase) for a 0..15 input. Leaf; no push/pop
+  // needed (no nested calls, no memory access).
+  // =========================================================================
+  pub let kem_hex_nibble : (u64) -> u64 !{mem} @{} =
+    fn (nibble: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "remote#6: kem_hex_nibble. cmp rdi,10; jl lt10 branches on whether the nibble (0..15, caller-guaranteed via a prior `and reg,0xF`) needs a '0'..'9' or 'a'..'f' digit. >=10 path: add rax,0x57 ('a'-10 = 0x61-0x0A = 0x57) after mov rax,rdi. <10 path: add rax,0x30 ('0' = 0x30). Both cmp/add immediates are tiny and well within the <=0x7FFFFFFF discipline. Reserved label prefixed kem_hn_.",
+      block: {
+        cmp rdi, 10;
+        jl kem_hn_lt10;
+
+        mov rax, rdi;
+        add rax, 0x57;
+        ret;
+
+      kem_hn_lt10:
+        mov rax, rdi;
+        add rax, 0x30;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // kem_hash_to_hex8(value, out_ptr) -> ()
+  //
+  // Writes 8 lowercase ASCII hex chars at out_ptr, MSB-nibble-first,
+  // covering value's low 32 bits (bits 31:28 -> out_ptr[0], ...,
+  // bits 3:0 -> out_ptr[7]). Bits above 31 are never read -- this is
+  // the ONLY truncation-to-32-bits step in the peer_key path, and it
+  // is done via eight hardcoded immediate `shr` amounts (28,24,...,0)
+  // each followed by `and rax,0xF` (a SMALL positive immediate -- safe
+  // under the encoder's `and reg,imm64` sign-extension pitfall, unlike
+  // a would-be single `and rax,0xFFFFFFFF` which sign-extends its
+  // 0xFFFFFFFF imm32 operand to all-ones-64-bit and masks nothing).
+  // =========================================================================
+  pub let kem_hash_to_hex8 : (u64, u64) -> () !{mem} @{} =
+    fn (value: u64) (out_ptr: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "remote#6: kem_hash_to_hex8. 2-push callee-save (rbx=value, r12=out_ptr) + sub rsp,8: entry rsp%16==8, 2 pushes (even) land back at rsp%16==8, pad -8 -> 0 for each of the 8 nested `call kem_hex_nibble` sites. Eight straight-line blocks (no loop -- matches ch_send_frame's own hardcoded shr 24/16/8/0 BE-composition precedent, extended to 8 nibbles): each does mov rax,rbx; shr rax,<28,24,20,16,12,8,4,0>; and rax,0xF; mov rdi,rax; call kem_hex_nibble; mov_b [r12+<0..7>],rax. rbx/r12 survive every call (callee-saved by kem_hex_nibble's own leaf-no-clobber body, which only touches rax/rdi). Reserved labels: none needed (no branches in this function itself).",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // value
+        mov r12, rsi;                    // out_ptr
+
+        mov rax, rbx;
+        shr rax, 28;
+        and rax, 0xF;
+        mov rdi, rax;
+        call kem_hex_nibble;
+        mov_b [r12 + 0], rax;
+
+        mov rax, rbx;
+        shr rax, 24;
+        and rax, 0xF;
+        mov rdi, rax;
+        call kem_hex_nibble;
+        mov_b [r12 + 1], rax;
+
+        mov rax, rbx;
+        shr rax, 20;
+        and rax, 0xF;
+        mov rdi, rax;
+        call kem_hex_nibble;
+        mov_b [r12 + 2], rax;
+
+        mov rax, rbx;
+        shr rax, 16;
+        and rax, 0xF;
+        mov rdi, rax;
+        call kem_hex_nibble;
+        mov_b [r12 + 3], rax;
+
+        mov rax, rbx;
+        shr rax, 12;
+        and rax, 0xF;
+        mov rdi, rax;
+        call kem_hex_nibble;
+        mov_b [r12 + 4], rax;
+
+        mov rax, rbx;
+        shr rax, 8;
+        and rax, 0xF;
+        mov rdi, rax;
+        call kem_hex_nibble;
+        mov_b [r12 + 5], rax;
+
+        mov rax, rbx;
+        shr rax, 4;
+        and rax, 0xF;
+        mov rdi, rax;
+        call kem_hex_nibble;
+        mov_b [r12 + 6], rax;
+
+        mov rax, rbx;
+        and rax, 0xF;
+        mov rdi, rax;
+        call kem_hex_nibble;
+        mov_b [r12 + 7], rax;
+
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // kem_peer_key_hash64(ptr, len) -> u64
+  //
+  // Jenkins one-at-a-time hash (public-domain, non-cryptographic) run
+  // natively in a 64-bit register: every step is add/xor/shl/shr, so
+  // register wraparound at 64 bits IS the reduction step -- no imul,
+  // no masking. Only the low 32 bits of the result are ever consumed
+  // (by kem_hash_to_hex8).
+  // =========================================================================
+  pub let kem_peer_key_hash64 : (u64, u64) -> u64 !{mem} @{} =
+    fn (ptr: u64) (len: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "remote#6: kem_peer_key_hash64. 3-push callee-save (rbx=cursor, r12=remaining, r13=hash state) -- odd count from rsp%16==8 entry lands on 0; no nested calls in this leaf loop (every step is register-only add/xor/shl/shr against r10 scratch) so alignment does not matter here but is kept for uniformity. mov rbx,rdi; mov r12,rsi; xor r13,r13 (state=0). Loop: cmp r12,0; jle finalize (countdown-remaining style, matching net_send_all/net_recv_all's own precedent in this file). xor rax,rax; mov_b rax,[rbx] (next byte); xor r13,rax (state ^= byte); mov r10,r13; shl r10,10; add r13,r10 (state += state<<10); mov r10,r13; shr r10,6; xor r13,r10 (state ^= state>>6); add rbx,1; sub r12,1; jmp loop. Finalize (Jenkins' fixed avalanche tail): mov r10,r13; shl r10,3; add r13,r10 (state += state<<3); mov r10,r13; shr r10,11; xor r13,r10 (state ^= state>>11); mov r10,r13; shl r10,15; add r13,r10 (state += state<<15). mov rax,r13; return. Reserved labels prefixed kem_pkh_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                    // cursor
+        mov r12, rsi;                    // remaining
+        xor r13, r13;                    // state = 0
+
+      kem_pkh_loop:
+        cmp r12, 0;
+        jle kem_pkh_finalize;
+
+        xor rax, rax;
+        mov_b rax, [rbx];
+        xor r13, rax;
+
+        mov r10, r13;
+        shl r10, 10;
+        add r13, r10;
+
+        mov r10, r13;
+        shr r10, 6;
+        xor r13, r10;
+
+        add rbx, 1;
+        sub r12, 1;
+        jmp kem_pkh_loop;
+
+      kem_pkh_finalize:
+        mov r10, r13;
+        shl r10, 3;
+        add r13, r10;
+
+        mov r10, r13;
+        shr r10, 11;
+        xor r13, r10;
+
+        mov r10, r13;
+        shl r10, 15;
+        add r13, r10;
+
+        mov rax, r13;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // kem_peer_key_fingerprint_hex(out_ptr) -> ()
+  //
+  // Writes 8 lowercase hex chars at out_ptr: kem_hash_to_hex8 of
+  // kem_peer_key_hash64(&kem_ek, KEM_PK_LEN). The ONE call site
+  // remote_client.pdx needs -- keeps kem_ek module-private (no
+  // cross-module .bss access needed at the call site, matching every
+  // other Kem/Channel boundary in this codebase, e.g.
+  // kem_client_handshake's own out_ss_ptr-only contract).
+  // =========================================================================
+  pub let kem_peer_key_fingerprint_hex : (u64) -> () !{mem} @{} =
+    fn (out_ptr: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "remote#6: kem_peer_key_fingerprint_hex. 1-push callee-save (rbx=out_ptr) + sub rsp,8: entry rsp%16==8, 1 push (odd) lands rsp%16==0 already for the first nested call (call kem_peer_key_hash64) -- wait, an ODD push count from rsp%16==8 lands at rsp%16==0 directly (8+8=16, 16%16==0), so no pad instruction is emitted; the `sub rsp,8`/`add rsp,8` pair is therefore OMITTED here (unlike the 2-push functions above) since 1 push alone already satisfies the pre-call alignment for both nested calls (kem_peer_key_hash64 then kem_hash_to_hex8). mov rbx,rdi (out_ptr). lea rdi,[rip+kem_ek]; mov rsi,1184 (KEM_PK_LEN); call kem_peer_key_hash64 -> rax = hash. mov rdi,rax; mov rsi,rbx; call kem_hash_to_hex8. pop rbx; ret.",
+      block: {
+        push rbx;
+
+        mov rbx, rdi;                    // out_ptr
+
+        lea rdi, [rip + kem_ek];
+        mov rsi, 1184;                   // KEM_PK_LEN
+        call kem_peer_key_hash64;
+
+        mov rdi, rax;
+        mov rsi, rbx;
+        call kem_hash_to_hex8;
+
+        pop rbx;
+        ret
+      }
+    }
+
   // -------------------------------------------------------------------------
   // Local trait declaration (module-local dispatch; see module header).
   // -------------------------------------------------------------------------
