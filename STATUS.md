@@ -15,6 +15,17 @@ stale: remote#2 (v0.5.0) already landed REAL kernel-linked
 corrects the record and adds `kem_encaps_raw` for trait-call parity;
 see CHANGELOG.md `[0.6.0]` for the full finding.
 
+**Related, separately-landed finding (see `design/link-recipe.md`,
+merged into this branch from a concurrent commit):** the source-level
+`MlKem768`/`ChaCha20Poly1305` calls in `src/kem.pdx`/`src/channel.pdx`
+are real, but `tools/build.sh` does not currently link the paideia-as
+satellite crypto runtime archive that defines their extern symbols
+(`paideia_crypto_ml_kem_768_*` / `paideia_crypto_chacha20_poly1305_*`)
+-- a real end-to-end BUILD of this repo fails undefined-symbol at the
+link step until that archive is wired in via the documented
+`--extra-archive` recipe. This is the "pre-existing crypto link-fail
+(WEAK stubs OK)" gap Wave mu's own dispatch text anticipated hitting.
+
 See `design/roadmap/post-r60-daily-use-roadmap.md` §R85 (paideia-os
 monorepo) for the full spec.
 
